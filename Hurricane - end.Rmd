@@ -1,0 +1,2676 @@
+---
+title: "Hurricane Resilience Trajectories"
+author: "Barney Ricca"
+date: "4/3/2021"
+output: word_document
+---
+## Setup
+
+### Outline
+
+1. Read data
+2. Check the CSE split
+3. Combine the days
+4. Reverse code some of the columns
+5. Add Z-score columns
+6. Identify seconds
+7. Identify incompletes
+8. Cluster, and record clusters: With and without Shift, and Psych/PTSD only.
+9. Create dCluster for each of the clusters
+10.
+
+
+# Which are healthiest? Least healthy?
+     N     Psy    PTSD     CSE   Shift  Approach   Avoid    Percd    Recd
+   213	  0.02	  0.10	  0.60	  0.70	    1.97	 -0.37	   0.72	   1.31
+ 	2400	  0.34	  0.45	  0.53	  0.71	   -0.25	  0.35	   0.35 	-0.05
+   157	  0.18	  0.06	 -0.53	 -0.62	    0.01	 -0.64	   0.02	   1.34
+    76	 -1.81	 -0.34	 -1.22	 -0.62	    0.04	  0.16	   0.71	   0.45
+   325	 -0.63	 -1.45	 -0.65	 -0.96	    1.13	 -0.48	  -0.54	   0.33
+ 	 934	 -0.29	 -0.34	 -0.87	 -1.33	   -0.42	 -0.29	  -0.72	  -0.60
+    44	  0.83	 -1.42	 -1.61	 -1.25	    2.08	 -1.65	  -1.51	   1.53
+   118	 -2.24	 -1.95	 -1.13	 -0.81	    0.56	 -1.39	  -1.19	  -0.45
+
+Notes from the sort:
+325 - trying to cope, hanging in there. (More chaotic coping.)
+157 - at risk profile? support seeking? Getting help. Emotion focused rather than problem focused. (May or may not be seeking.)
+325 vs. 76: Depends upon how we value different things.
+44 trying to manage, but right on the cusp of falling apart.
+
+# Setup
+```{r setup, include = FALSE}
+c("apaTables",      # Well formatted APA tables
+  "chron",          # Convert character to time
+  "cluster",        # Daisy via Gower
+  "conflicted",     # To handle package function name conflicts
+  "corrplot",       # Correlation plots
+  "crqa",           # RQA routines
+  "data.table",     # Faster data access
+  "doParallel",     # For parallel processing
+  "dplyr",          # Data wrangling
+  "dtplyr",         # For faster dplyr
+  "foreach",        # To work with parallel
+  "geomnet",        # For plotting networks/igraphs
+  "gtools",
+  "haven",          # For SPSS import
+  "here",           # To find/store files w/o setwd() and getwd()
+  "igraph",         # I'm still better at this than statnet
+#  "intergraph",     # igraph <-> statnet conversions
+  "knitr",          # For slighly better tables
+  "lmPerm",
+  "magrittr",       # For the %>% and %$% pipes
+  "MASS",
+  "parallelDist",   # Use multiple cores to compute distance matrix
+  "poweRlaw",       # Power-law fit
+  "qgraph",         # For plotting the transition networks
+#  "Rcpp",           # For speed when needed
+#  "statnet",        # ERGM, etc.
+  "stringr",        # String manipulation
+  "tidytable",      # Faster tidyr
+  "tidyr",          # Data wrangling
+  "tseriesChaos"    # Some useful functions
+) -> package_names
+
+# Are these needed (RQA)?
+#library(nonlinearTseries)
+#library(tm)
+
+for(package_name in package_names) {
+  if(!is.element(package_name, installed.packages()[,1])) {
+    install.packages(package_name)
+  }
+  library(package_name, character.only=TRUE,
+          quietly=TRUE,verbose=FALSE)
+}
+
+rm(list=c("package_names","package_name"))
+
+set_here()      # This helps with folder structure when shifting computers
+
+set.seed(03042021)                 # Set the seed
+
+# Stuff I prefer
+options(show.signif.stars = FALSE) # Conflates significance & effect size
+options(digits = 3)                # Round to 4 digits
+
+# Conflicted has idetnified conflicts. I'll set the defaults here as
+#  those arise:
+conflict_prefer("filter", "dplyr")
+conflict_prefer("select", "dplyr")
+```
+
+## Helper Functions
+Several helper functions are defined.
+
+```{r functions, include = FALSE}
+
+check_sil <- function(df, index, values) {
+  require("parallelDist")
+  unlist(str_split(index,
+                   "[.]")) -> string_ls
+  as.integer(string_ls[3]) -> i
+
+  paste0(string_ls[1],".",
+         string_ls[2],".",
+         i-1) -> index
+  silhouette(df[,index],
+             parDist(as.matrix(select(df, 
+                            all_of(values))))) ->
+    sil.hclust
+  print(i-1)
+  print(length(which(sil.hclust[,3] < 0)))
+  print(mean(sil.hclust[,3]))
+  print(table(sil.hclust[,1]))
+
+  paste0("k.eq.", i) -> index
+  silhouette(df[,index],
+             dist(select(df, all_of(values)))) ->
+    sil.hclust
+
+  print(i)
+  print(length(which(sil.hclust[,3] < 0)))
+  print(mean(sil.hclust[,3]))
+  print(table(sil.hclust[,1]))
+
+  paste0("k.eq.", i+1) -> index
+  silhouette(df[,index],
+             dist(select(df, all_of(values)))) ->
+    sil.hclust
+  print(i+1)
+  print(length(which(sil.hclust[,3] < 0)))
+  print(mean(sil.hclust[,3]))
+  print(table(sil.hclust[,1]))
+
+  return()
+}
+
+diff_hist <- function(d, n, titles) {
+  png(file = here(paste0("Output/",
+                         base::colnames(d)[n],
+                         ".png")),
+      bg = "transparent")
+  hist(d[,n],
+       xlab = "Difference",
+       main = paste("Intraday Difference in ",
+                    titles[n]),
+       breaks = seq(min(d[,n]) - 0.5,
+                max(d[,n]) + 0.5,
+                1))
+  dev.off()
+  return()
+}
+
+intEDA <- function(dc) {          # Works for logical variables too.
+  return(c(
+    mean(dc, na.rm = TRUE),
+    sd(dc, na.rm = TRUE),
+    median(dc, na.rm = TRUE),     # Data are Likert scale; non-parametrics
+    mad(dc, na.rm = TRUE),
+    min(dc, na.rm = TRUE),
+    max(dc, na.rm = TRUE),
+    length(which(is.na(dc) == TRUE))))
+}
+
+make_trans <- function(id,
+                       df,
+                       cuts,
+                       markov = TRUE) { # Markov matrix (TRUE) or count 
+                                        #  of transitions (FALSE)
+  
+  str_split(cuts, "[.]") -> str_ls
+  as.integer(str_ls[[1]][3]) -> num_nodes
+  
+  df %>%
+    dplyr::filter(., ID == id) -> ts_data
+  as.vector(ts_data[,cuts]) -> ts
+
+  # Create a transition matrix placeholder
+  matrix(0,
+         nrow = num_nodes,
+         ncol = num_nodes,
+         dimnames = list(1:num_nodes, 1:num_nodes)) -> trans_mat
+
+  length(ts) -> ts_len
+
+  if(ts_len > 1) {  # Just to make sure
+    ts[-1] -> ts1
+    for(index in 1:(ts_len - 1)) {
+      trans_mat[ts[index], ts1[index]] + 1 ->
+        trans_mat[ts[index], ts1[index]]
+    }
+  }
+
+  if(markov == TRUE) {    # Each row must sum to 1. (Transitions row to col)
+    rowSums(trans_mat) -> rowsums
+    for(row in 1:nrow(trans_mat)) {
+      if(rowsums[row] != 0) {
+        trans_mat[row,] / rowsums[row] -> trans_mat[row,]
+      }
+    }
+  }
+  return(as.matrix(trans_mat))  # Seems to make a difference
+}
+
+num_clusts <- function(sils) {
+  0 -> possible_rows
+  for(rows in 2:(nrow(sils)-1)) {
+    if(sils[rows-1,2] > sils[rows,2] &
+       sils[rows+1,2] > sils[rows,2] &
+       sils[rows-1,3] < sils[rows,3] &
+       sils[rows+1,3] < sils[rows,3]) {
+      c(possible_rows, rows) -> possible_rows
+    }
+  }
+  if(length(possible_rows) > 1) {
+    possible_rows[-1] -> possible_rows
+  }
+  return(sils[possible_rows,1])
+}
+
+pseudoAttractor <- function(df,              # Full data frame
+                            columns,         # Columns to cluster by
+                            name,
+                            cut_start = 2,   # Smallest number of clust.
+                            cut_end = 30) {  # Largest number of clusts.
+  ncol(df) -> num_col                        # Number of data columns
+  num_col + 1 -> col_start                   # Starting column to
+                                             #  store clusters numbers
+  num_col + 1 + cut_end - cut_start -> 
+    col_end                                  # Ending column to store
+                                             #  store cluster numbers
+  scale(df[,columns]) -> Z           # Use Z-scores
+  Z -> df[,columns]                  # Return Z-scores
+  parDist(x = as.matrix(Z),          # Create the distance matrix
+        method = "euclidean") ->     # Use this one for now
+  score_dist                         # The distance matrix
+
+  round(score_dist, digits = 3) ->   # Ignore round-off errors
+    score_dist_3                     # This matters!
+
+  hclust(score_dist_3,               # Hierarchical clustering
+         method = "average",         # Use distance to cluster average
+         members = NULL) -> clust    #
+
+  cutree(clust,
+         cut_start:cut_end) -> 
+    groups                           # Group memberships
+  cbind(df, groups) -> full_df       # Add memberships to df
+  paste0(name,           # Rename columns
+         colnames(groups)) -> 
+    colnames(full_df)[col_start:col_end]
+
+  # Silhouettes
+  matrix(0, ncol = 3,                # Pre-allocation
+         nrow = cut_end - cut_start + 1) -> 
+    silhouettes
+  for(index in col_start:col_end) {  # For each cut
+    silhouette(full_df[,index],      # Compute the silhouette
+               dist(full_df[,columns])) -> sil.hclust
+    c(index + 2 - col_start,         # Cut number
+      length(which(sil.hclust[,3] < 0)), # Mis-classified
+      mean(sil.hclust[,3])) ->       # Silhouette statistic
+      silhouettes[index + 1 - col_start, ]
+  }
+  return(list(full_df, silhouettes))
+}
+
+transition_mat <- function(ts, codes) {
+  matrix(0, nrow = length(codes),
+         ncol = length(codes),
+         dimnames = list(unique(codes),
+                         unique(codes))) -> trans_mat
+  ts[-1] -> ts1
+  for(index in 1:(length(ts)-1)) {
+    trans_mat[ts[index], ts1[index]] + 1 ->
+      trans_mat[ts[index], ts1[index]]
+  }
+  return(trans_mat)
+}
+```
+
+Process the NIS survey results (only run once!) Due to a glitch in the software, some participants on some days were pinged multiple times, resulting in multiple readings for that day. On such days only the earliest response will be retained in the main data file, while the other responses will be retained in a separate value. (Possible uses of the other data: To provide estimates of response uncertainty. To use to explore dynamics on time scales shorter than one day.)
+
+# Data
+
+## Read data
+
+```{r NISdata, include = FALSE}
+# The next was done once; it isn't necessary to do again.
+# Load and clean up SPSS survey data:
+haven::read_sav(here("Data/Full_NIS_Cleaned_NoEMAnumber.sav")) ->
+  NISresults
+
+for(item_num in 1:ncol(NISresults)) {   # Remove some SPSS info. 
+  NULL -> attr(NISresults[[item_num]], "format.spss")
+}
+NULL -> attr(NISresults[[2]], "display_width")
+NULL -> attr(NISresults[[3]], "display_width")
+NULL -> attr(NISresults[[5]], "units")
+
+# Separate day & time
+strsplit(NISresults$NotificationTime, " ") -> 
+  session_list
+data.frame(matrix(unlist(session_list),
+                  nrow = length(session_list),
+                  ncol = 2,
+                  byrow = TRUE)) -> 
+  session_df
+c("Notification Date", "Notification Time") -> 
+  colnames(session_df)
+as.Date(session_df$`Notification Date`,
+        format = "%m/%d/%Y") -> 
+  session_df$`Notification Date`
+paste0(session_df$`Notification Time`,":00") -> 
+  session_df$`Notification Time`
+cbind(NISresults, session_df) -> 
+  NISresults
+NISresults[,c(1, 57, 58, 3:56)] -> 
+  NISresults                         # Reorder columns
+```
+
+Merge survey data, including the 3- and 6-month surveys.
+```{r months3_6_data, include = FALSE}
+haven::read_sav(here("Data/REACH_baseline_3MO_6MO_deidentified_LH.sav")) -> 
+  survey_df
+for(item_num in 1:ncol(survey_df)) {   # Remove some SPSS info. 
+  NULL -> attr(survey_df[[item_num]], "format.spss")
+  NULL -> attr(survey_df[[item_num]], "display_width")
+}
+
+# PCL_Total are the PTSD measures; they are already totaled in the survey 
+#  file.
+left_join(x = NISresults,
+          y = survey_df[,c("id", "PCL_Total_T1", 
+                           "PCL_Total_T2", "PCL_Total_T3")],
+          by = c("StudyID" = "id")) -> NISresults
+```
+
+## Clean Data
+### Data Issues
+I discovered (much later) that there is a data issue. I'll fix it here, although I didn't discover it here.
+
+First, Identify the doubled data
+```{r, eval = FALSE, include = FALSE}
+NISresults %>%
+  arrange(., StudyID, `Notification Date`, `Notification Time`) -> 
+  NISresults
+
+for(row in 1:(nrow(NISresults)-1)) {
+  if(NISresults[row,1] == NISresults[row+1,1] &
+     NISresults[row,2] == NISresults[row+1,2] &
+     NISresults[row,3] == NISresults[row+1,3]) {
+    print(NISresults[row,1:3], NISresults[row+1,1:3], row)
+  }
+}
+
+View(NISresults[c(954, 955, 2413, 2414, 4602, 4603),])
+```
+Now, remove the doubled data. This will involve removing 4 incomplete rows in the data: 955, 2413, 4602, and 4603 are incomplete so I will remove them. (This takes out both of the observations from participant 255 on the particular day, but so be it.)
+```{r}
+NISresults[-c(955, 2413, 4602, 4603),] -> 
+  NISresults  # Data issues
+```
+
+### Mutliple Intraday Observations
+Separate first from second observations in a day; table them.
+```{r repeats}
+# Need to sort things chronologically by participant
+NISresults[order(NISresults$StudyID,
+                     NISresults$`Notification Date`,
+                     NISresults$`Notification Time`),] -> NISresults
+
+# Mark the technology glitches.
+0 -> row_check
+for(row in 1:(nrow(NISresults)-1)) {
+  if(NISresults[row,1] == NISresults[row+1,1] &
+     NISresults[row,2] == NISresults[row+1,2]) {
+    c(row_check, row+1) -> 
+      row_check
+  }
+}
+
+# Ordering = 0 for only observation in a day
+# Ordering = 1 for first of mulitple observations in a day (first_row)
+# Ordering = 2 for second of multiple observations in a day (row_check)
+row_check[-1] -> 
+  row_check
+row_check-1 -> 
+  first_row
+rep(0, nrow(NISresults)) -> 
+  NISresults$Ordering
+1 -> NISresults$Ordering[first_row]
+2 -> NISresults$Ordering[row_check]
+
+# Old version:
+# rep(1, nrow(NISresults)) -> 
+#   NISresults$Ordering
+# 2 -> NISresults$Ordering[row_check]
+
+table(NISresults$Ordering)
+```
+
+### Reverse coding
+```{r coding, include = FALSE}
+# Correct for reverse coding:
+5 - NISresults[,7:10] -> NISresults[,7:10]    # Psych A
+1 - NISresults[,11:15] -> NISresults[,11:15]  # PTSD A
+# Social Support A 16-18
+# Received Support A 19-21
+# CSE A 22-25
+# Approach Coping A 26-27
+1 - NISresults[,28:29] -> NISresults[,28:29]  # Avoidance Coping A
+1 - NISresults[,30:32] -> NISresults[,30:32]  # Cog Shift A
+5 - NISresults[,33:36] -> NISresults[,33:36]  # Psych B
+# Social Support 37-39
+1 - NISresults[,40:42] -> NISresults[,40:42]  # Cog Shift 
+# Received Support 43-45
+# CSE 46-48
+# Approach Coping B 49-50
+1 - NISresults[,51:52] -> NISresults[,51:52]  # Avoidance Coping
+1 - NISresults[,53:57] -> NISresults[,53:57]  # PTSD
+```
+
+### Create instruments
+Create instruments and Z-score them
+```{r scaling_instruments, include = FALSE}
+# Create the instrument values for NISData A Days
+unname(apply(NISresults[,c(7:10, 33:36)], 1, sum, na.rm = TRUE)) -> 
+  NISresults$Psych
+unname(apply(NISresults[,c(11:15, 53:57)], 1, sum, na.rm = TRUE)) -> 
+  NISresults$PTSD
+unname(apply(NISresults[,c(16:18, 37:39)], 1, sum, na.rm = TRUE)) -> 
+  NISresults$Perceived
+unname(apply(NISresults[,c(19:21, 43:45)], 1, sum, na.rm = TRUE)) -> 
+  NISresults$Received
+unname(apply(NISresults[,c(26:27, 49:50)], 1, sum, na.rm = TRUE)) -> 
+  NISresults$Approach
+unname(apply(NISresults[,c(28:29, 51:52)], 1, sum, na.rm = TRUE)) -> 
+  NISresults$Avoid
+
+rep(0, nrow(NISresults)) -> NISresults$CSE
+(7/4) * 
+  unname(
+    apply(
+      NISresults[which(!is.na(NISresults$emotions)), 22:25],
+      1, sum, na.rm = TRUE)) ->
+  NISresults$CSE[which(!is.na(NISresults$emotions))]
+(7/3) * 
+  unname(
+    apply(NISresults[which(!is.na(NISresults$normal)),46:48],
+          1, sum, na.rm = TRUE)) ->
+  NISresults$CSE[which(!is.na(NISresults$normal))]
+
+unname(apply(NISresults[,c(30:32, 40:42)], 1, sum, na.rm = TRUE)) -> 
+  NISresults$Shift
+
+scale(NISresults[, c("Psych", "PTSD", "Perceived", "Received", 
+                     "Approach", "Avoid", "CSE", "Shift")]) -> 
+  NISresults[ , c("ZPsych", "ZPTSD", "ZPerceived", "ZReceived",
+                  "ZApproach", "ZAvoid", "ZCSE", "ZShift")]
+```
+
+### Incomplete cases
+```{r completeCases}
+TRUE -> NISresults$CompleteCase
+
+for(row in 1:nrow(NISresults)) {
+  if(NISresults$SessionName[row] == "REACH_1" &
+     length(which(is.na(NISresults[row,7:32]))) > 0) {
+    FALSE -> NISresults$CompleteCase[row]
+  }
+  if(NISresults$SessionName[row] == "REACH_2" &
+     length(which(is.na(NISresults[row,33:57]))) > 0) {
+    FALSE -> NISresults$CompleteCase[row]
+  }
+}
+
+dim(NISresults)
+length(which(NISresults$CompleteCase == FALSE))
+
+table(NISresults$Ordering, NISresults$CompleteCase)
+```
+I get 158 incomplete cases. This all checks:
+
+4762 Total observations (4444 firsts and 318 seconds)
+158 incomplete cases (147 firsts and 11 seconds)
+4604 Complete cases (4297 firsts and 307 seconds)
+
+### Column Names
+To facilitate collapsing of codes, make the column names equivalent to those used in the other file:
+```{r}
+c("ID", "Date", "Time", "Day") -> colnames(NISresults)[1:4]
+```
+
+### Short Data
+Because we are going to create trajectories, we will omit participants who responded to fewer than 25% of the prompts; 0.25 is an arbitrary number, but it creates trajectories only from those who responded with complete responses at least 11 times.
+```{r shorts}
+# Using only data that are at least 25% complete; this removes about
+#  4% of the total responses.
+42 -> num_days
+0.25 -> pct_needed # 25% is arbitrary.
+NISresults %>%
+  filter(., CompleteCase == TRUE) %>%
+  group_by(., ID) %>%
+  summarize(N = n()) -> ID_num
+
+TRUE -> NISresults$LengthOK
+FALSE -> 
+  NISresults$LengthOK[
+    which(NISresults$ID %in% ID_num$ID[
+      which(ID_num$N < num_days * pct_needed)])]
+
+NISresults %>%
+  filter(., LengthOK == TRUE &
+           (Ordering == 1 | Ordering == 0) &
+           CompleteCase == TRUE) %>%
+  summarise("N" = n())
+
+nrow(
+  unique(
+    NISresults %>%
+      filter(., LengthOK == TRUE &
+               (Ordering == 1 | Ordering == 0) &
+               CompleteCase == TRUE) %>%
+      select(., ID)))
+save(NISresults, file = here("Data/NISresults.RData"))
+```
+4762 Total observations (4444 firsts and 318 seconds)
+158 incomplete cases (147 firsts and 11 seconds)
+4604 Complete cases (4297 firsts and 307 seconds)
+
+This marks 209 (4.4%) of the total responses, and 34 (20.6%) of the participants as being too short. Some of those are incomplete cases. 4139 cases are long enough, first observation of the day, and complete.
+
+## EDA and CSE USE
+Let's look quickly at the data:
+- Median & mad for things. (Because the data are converted to z-scores, we know the mean is 0 and the standard deviation is 1 for each variable, before incomplete cases are removed.)
+- Scales (min/max)
+- Missing data
+
+In addition, there are 6 identifiers (Study_ID, Session Start Date, Session Start Time, CompletedSession, SessionLength) and 3 open-ended responses (situation, Thoughtsit, copemethod).
+
+```{r NIS_EDA}
+c("Psych", "PTSD", "Perceived", "Received",
+  "Approach", "Avoid", "CSE", "Shift") -> instrument_names
+
+t(apply(NISresults %>%
+        filter(., (Ordering == 1 | Ordering == 0)) %>%
+        select(., all_of(instrument_names)),
+      2, intEDA)) %>% 
+  kable(.,
+        digits = 2,
+        col.names = c("Mean", "sd", "Median", "MAD", 
+                      "Min", "Max", "Missing"),
+        caption = "NIS First Intraday Responses Summary")
+
+t(apply(NISresults %>%
+        filter(., Ordering == 2) %>%
+        select(., all_of(instrument_names)),
+      2, intEDA)) %>% 
+  kable(.,
+        digits = 2,
+        col.names = c("Mean", "sd", "Median", "MAD", 
+                      "Min", "Max", "Missing"),
+        caption = "NIS Second Intraday Responses Summary")
+
+t(apply(NISresults %>%
+        select(., all_of(instrument_names)),
+      2, intEDA)) %>%
+  kable(.,
+        digits = 2,
+        col.names = c("Mean", "sd", "Median", "MAD", 
+                      "Min", "Max", "Missing"),
+        caption = "NIS All Responses Summary")
+
+
+
+#rep(1, length = nrow(NIS_Data_red)) -> NIS_Data_red$Response
+#rep(2, length = nrow(NIS_Seconds_red)) -> NIS_Seconds_red$Response
+#rbind(NIS_Data_red, NIS_Seconds_red) -> NIS_Repeated
+
+NISresults[order(NISresults$ID,
+                 NISresults$`Date`,
+                 NISresults$`Time`),] -> NISresults
+diff(NISresults$Date) -> changes
+which(changes == 0) -> first
+first + 1 -> second
+
+NISresults[c(first, second),] -> NIS_Doubles
+NIS_Doubles[order(NIS_Doubles$ID,
+                  NIS_Doubles$`Date`,
+                  NIS_Doubles$`Time`),] -> NIS_Doubles
+# The odd numbered indices are the first response each day, and the next 
+#  even numbered index is the second response that day.
+apply(NIS_Doubles[,all_of(instrument_names)],
+      2, diff) -> same_day_diffs
+# But we only want the odd-numbered rows from same_day_diffs
+same_day_diffs[seq(1, nrow(same_day_diffs), 2),] -> same_day_diffs
+
+print("Same day score differences, scaled to data range.")
+for(col in 1:ncol(same_day_diffs)) {
+  print(
+    paste0("Difference in ",
+           colnames(same_day_diffs)[col],
+           " scores: Mean = ",
+           round((mean(same_day_diffs[,col]) /
+                   (max(same_day_diffs[,col]) - 
+                      min(same_day_diffs[,col]))),3),
+           " , sd = ",
+           round((sd(same_day_diffs[,col]) /
+                   (max(same_day_diffs[,col]) - 
+                      min(same_day_diffs[,col]))),3))
+  )
+}
+
+# Now, look at some histograms
+c("Psychological Distress", "PTSD",
+  "Perceived Support", "Received Support", 
+  "Approach Coping", "Avoidance Coping", "Coping Self-Efficacy",
+  "Cognitive Shift") -> graph_names
+
+for(index in 1:8) {
+  diff_hist(same_day_diffs, index, graph_names)
+}
+
+#rbind(NIS_Data_red, NIS_Seconds_red) -> NIS_Compare
+NIS_Doubles %>%
+  filter(., CompleteCase == TRUE) -> NIS_Doubles
+for(i in instrument_names) {
+  print(
+    summary(
+      aovp(NIS_Doubles[,i] ~ NIS_Doubles[,"Ordering"])))
+}
+```
+
+### CSE Use
+The 7-item CSE was split into two parts (4 items and 3 items) for use in the NIS. We can use the UIS data to see how what impact splitting may have; if there is a high correlation among the items, we'll treat the two NIS groupings as inter-changeable (if scaled appropriately).
+
+Particularly, because of the NIS split, does {emotions, loseit, supportothers, gethelp} correlate with {normal, dreams, happening}?
+```{r CSE_cor, include = FALSE}
+load(here("Data/UISSurveyData.RData"))
+
+cor(UISresults[,15:21],
+    use = "complete.obs") -> CSE_cor
+corrplot(CSE_cor, method = "number",
+         type = "upper")
+
+data.frame("A" = UISresults$emotions + UISresults$loseit +
+             UISresults$suppothers + UISresults$gethelp,
+           "B" = UISresults$normal + UISresults$dreams +
+             UISresults$happening) -> CSE_split
+cor(x = CSE_split$A, y = CSE_split$B,
+    use = "complete.obs")
+
+```
+OK, the correlation between the sums of the two splits is 0.8671, and the individual items look reasonably well correlated, so we'll go ahead and just use the two sub-instruments as interchangeable (appropriately scaled, of course).
+
+
+# Pseudo-Attractors
+OK, having done a bunch of exploratory stuff, let's create a transition network. Here's what we will do:
+
+1. Combine NIS Days A and B into a single data set, taking care to deal with the alternating days in the NIS.
+2. Recalculate Z-scores for survey results. (The CSE will have to be considered carefully because in the NIS they are split into two. Scale everything appropriately.) 
+3. Create clusters, and summarize the instruments (mean and standard deviation) for each cluster. These will be the pseudo-attractors.
+4. Choose a number of clusters from which to create transition networks.
+
+Open question: What is the appropriate distance/dissimilarity measure to use here? (In particular, is the Euclidean distance bad?) I think that the problem with poor clustering comes from the original data, and that no method will fix it. However, we should try to be as good as possible.
+
+Should Z-scores or raw scores be used? For some methods (e.g. average) I don't think it matters. (The clusters will come out the same, although I suspect the silhouette scores will differ.) Still...do them both ways.
+```{r Clustering_attractors}
+# Compute the pseudo-attractors on the listed columns
+pseudoAttractor(NISresults %>%
+                  filter(., (Ordering == 1 | Ordering == 0) &
+                           CompleteCase == 1 &
+                           LengthOK == TRUE),
+                c("Psych", "PTSD", "CSE", "Shift", "Approach",
+                  "Avoid", "Perceived", "Received"),
+                "k.eq.") -> pA_ls
+
+print("Possible clustering: with Shift, raw scores")
+num_clusts(pA_ls[[2]])  # Possible cluster cut numbers. These are NOT
+                        #  the row numbers in pA_ls[[2]].
+pseudoAttractor(NISresults %>%
+                  filter(., (Ordering == 1 | Ordering == 0) &
+                           CompleteCase == 1 &
+                           LengthOK == TRUE),
+                c("Psych", "PTSD", "CSE", "Approach",
+                  "Avoid", "Perceived", "Received"),
+                "kns.eq.") -> pA_ls_noShift
+
+print("Possible clustering: no Shift, raw scores")
+num_clusts(pA_ls_noShift[[2]])  # Possible cluster cut numbers. These are NOT
+                                #  the row numbers in pA_ls_noShift[[2]].
+
+pseudoAttractor(NISresults %>%
+                  filter(., (Ordering == 1 | Ordering == 0) &
+                           CompleteCase == 1 &
+                           LengthOK == TRUE),
+                c("ZPsych", "ZPTSD", "ZCSE", "ZShift", "ZApproach",
+                  "ZAvoid", "ZPerceived", "ZReceived"),
+                "kz.eq.") -> pA_Z_ls
+
+print("Possible clustering: with shift, Z scores")
+num_clusts(pA_Z_ls[[2]])  # Possible cluster cut numbers. These are NOT
+                        #  the row numbers in pA_ls[[2]].
+pseudoAttractor(NISresults %>%
+                  filter(., (Ordering == 1 | Ordering == 0) &
+                           CompleteCase == 1 &
+                           LengthOK == TRUE),
+                c("ZPsych", "ZPTSD", "ZCSE", "ZApproach",
+                  "ZAvoid", "ZPerceived", "ZReceived"),
+                "knsz.eq.") -> pA_Z_ls_noShift
+
+print("Possible clustering: no shift, Z scores")
+num_clusts(pA_Z_ls_noShift[[2]])  # Possible cluster cut numbers. These are NOT
+                                #  the row numbers in pA_ls_noShift[[2]].
+
+
+```
+These are much different than before the problematic data were removed.
+
+Put the clusterings into NISresults
+```{r}
+left_join(NISresults,
+          pA_ls[[1]][,c(1:3,77:105)],
+          by = c("ID", "Date", "Time")) -> NISresults
+
+left_join(NISresults,
+          pA_ls_noShift[[1]][,c(1:3,77:105)],
+          by = c("ID", "Date", "Time")) -> NISresults
+
+left_join(NISresults,
+          pA_Z_ls_noShift[[1]][,c(1:3,77:105)],
+          by = c("ID", "Date", "Time")) -> NISresults
+
+left_join(NISresults,
+          pA_Z_ls[[1]][,c(1:3,77:105)],
+          by = c("ID", "Date", "Time")) -> NISresults
+```
+
+
+OK so far. Examine the clustering possibilities.
+```{r check_silhouettes, eval = FALSE, include = FALSE}
+print("Z-score clusters with shift")
+check_sil(NISresults %>%
+            filter(., CompleteCase == TRUE) %>%
+            filter(., (Ordering == 1 | Ordering == 0)) %>%
+            filter(., LengthOK == TRUE), 
+          "kz.eq.6", 
+          c("ZPsych", "ZPTSD", "ZCSE", "ZShift",
+            "ZApproach", "ZAvoid", "ZPerceived", "ZReceived"))
+
+print("Z-score clusters without shift")
+check_sil(NISresults %>%
+            filter(., CompleteCase == TRUE) %>%
+            filter(., (Ordering == 1 | Ordering == 0)) %>%
+            filter(., LengthOK == TRUE), 
+          "knsz.eq.10", 
+          c("ZPsych", "ZPTSD", "ZCSE", "ZShift",
+            "ZApproach", "ZAvoid", "ZPerceived", "ZReceived"))
+
+print("Z-score clusters without shift")
+check_sil(NISresults %>%
+            filter(., CompleteCase == TRUE) %>%
+            filter(., (Ordering == 1 | Ordering == 0)) %>%
+            filter(., LengthOK == TRUE), 
+          "knsz.eq.14", 
+          c("ZPsych", "ZPTSD", "ZCSE", "ZShift",
+            "ZApproach", "ZAvoid", "ZPerceived", "ZReceived"))
+
+print("Z-score clusters without shift")
+check_sil(NISresults %>%
+            filter(., CompleteCase == TRUE) %>%
+            filter(., (Ordering == 1 | Ordering == 0)) %>%
+            filter(., LengthOK == TRUE), 
+          "knsz.eq.18", 
+          c("ZPsych", "ZPTSD", "ZCSE", "ZShift",
+            "ZApproach", "ZAvoid", "ZPerceived", "ZReceived"))
+
+print("Z-score clusters without shift")
+check_sil(NISresults %>%
+            filter(., CompleteCase == TRUE) %>%
+            filter(., (Ordering == 1 | Ordering == 0)) %>%
+            filter(., LengthOK == TRUE), 
+          "knsz.eq.23", 
+          c("ZPsych", "ZPTSD", "ZCSE", "ZShift",
+            "ZApproach", "ZAvoid", "ZPerceived", "ZReceived"))
+
+print("Z-score clusters without shift")
+check_sil(NISresults %>%
+            filter(., CompleteCase == TRUE) %>%
+            filter(., (Ordering == 1 | Ordering == 0)) %>%
+            filter(., LengthOK == TRUE), 
+          "knsz.eq.26", 
+          c("ZPsych", "ZPTSD", "ZCSE", "ZShift",
+            "ZApproach", "ZAvoid", "ZPerceived", "ZReceived"))
+```
+
+6, w shift: 953 & 0.11 -> 618 & 0.178 -> 789 & .156
+10, w/o shift: 1449 & 0.0752 -> 1050 & 0.133 -> 1101 & 0.125
+14, w/o shift: 1681 & 0.0427 -> 1135 & 0.104 -> 1142 & 0.101
+18, w/o shift: 1391 & 0.0655 -> 1051 & 0.111 -> 1160 & 0.108
+23, w/o shift: 1455 & 0.0579 -> 1326 & 0.0887 -> 1232 & 0.097 (????)
+26, w/o shift: 1214 & 0.0877 -> 1179 & 0.102 -> 1254 & 0.0924
+
+6-solution has 2 decent clusters
+10-solution has 5-6 decent clusters
+14-solution has 6-7 decent clusters
+18-solution has 9-10 decent clusters
+23-solution has 10-11 decent clusters
+26-solution has 13-15 decent clusters
+
+How many clusters? Looking at the silhouettes, is seems that 18 clusters (Z-scores, without _Shift_) would be appropriate. Fewer clusters doesn't give very much that's helpful (although 14 isn't bad) and more is just too mis-specified (although 26 isn't bad).
+
+Check the distributions.
+```{r}
+table(NISresults$knsz.eq.26)
+table(NISresults$knsz.eq.18)
+table(NISresults$knsz.eq.14)
+table(NISresults$knsz.eq.10)
+```
+For 26: This yields 15 legitimate clusters; the others have 38 (about 0.9%) of the entries.
+
+For 23: This yields 10 legitimate clusters, and 13 not-so-big clusters. The not-so-big have a total of 87 (about 2%) of the entries. Accepting cluster 16 as a legitimate cluster gives 11 legitimate and 12 not-so-legitimate clusters; the latter have 64 (about 1.5%) of the entries.
+
+The 18-solution has 9 & 9 (with the latter totalling 23 entries). The 10-solution has 4 and 6 (or 5 & 5) with the latter having 17 of the entries. The silhouette scores for the 10- and 18-solutions aren't much different, but the 10 solution has one really huge cluster. 
+
+The 14-solution has about 0.5% in "transients." Let's work with knsz.eq.14 for now.
+
+## pA with kmeans()
+Try kmeans() clustering and kNN to see what we get.
+```{r, eval = FALSE, include = FALSE}
+# This uses the old nomenclature.
+list() -> kmeans_ls
+unname(apply(NISresults %>%
+               filter(., CompleteCase == TRUE) %>%
+               filter(., (Ordering == 1 | Ordering == 0)) %>%
+               filter(., LengthOK == TRUE) %>%
+               select(., all_of(c("ZPsych", "ZPTSD", "ZCSE", 
+                                  "ZShift", "ZApproach", "ZAvoid",
+                                  "ZPerceived", "ZReceived"))),
+      2,
+      scale)) ->
+  kmeans_data
+for(clusts in 2:16) {
+  kmeans(kmeans_data,
+         clusts) -> kmeans_ls[[(clusts-1)]]
+  print(table(kmeans_ls[[clusts-1]]$cluster))
+}
+```
+These clusters are much more evenly distributed. Let's look at these results via silhouettes, etc.
+```{r, eval = FALSE, include = FALSE}
+# This uses the old nomenclature
+pA_ls[[1]] -> pA_kmeans_ls
+for(clust in 2:16) {
+  kmeans_ls[[clust-1]]$cluster -> pA_kmeans_ls[clust+75]
+}
+
+check_sil(pA_kmeans_ls, 
+          "k.eq.16", 
+          c("Psych", "PTSD", "CSE", "Shift",
+            "Approach", "Avoid", "Perceived", "Received"))
+check_sil(pA_kmeans_ls, 
+          "k.eq.10", 
+          c("Psych", "PTSD", "CSE", "Shift",
+            "Approach", "Avoid", "Perceived", "Received"))
+check_sil(pA_kmeans_ls, 
+          "k.eq.13", 
+          c("Psych", "PTSD", "CSE", "Shift",
+            "Approach", "Avoid", "Perceived", "Received"))
+check_sil(pA_kmeans_ls, 
+          "k.eq.16", 
+          c("Psych", "PTSD", "CSE", "Shift",
+            "Approach", "Avoid", "Perceived", "Received"))
+```
+Notice that there are two reasons to not use kmeans() clustering:
+a) the clusters are too evenly distributed; the preference is to produce even clusters
+b) there are no substantial changes between the clustering for different values of k.
+
+We can't do k-nearest neighbor because we don't know the true
+classifications of the training set.
+
+So, use the hclust() pseudo-attractors. Let's get the statistics for each of these pseudo-attractor groups.
+
+Using the 14-cluster, Shift-included results:
+```{r 14_clusterCenters}
+"knsz.eq.14" -> solution  # See the !!sym() below
+
+suppressWarnings(NISresults %>%
+                   filter(., CompleteCase == TRUE) %>%
+                   filter(., (Ordering == 1 | Ordering == 0)) %>%
+                   filter(., LengthOK == TRUE) %>%
+                   group_by(., !!sym(solution)) %>%  # !!sym()
+                   # I think it is a R 4.0 thing, but there are 
+                   #  changes in the !!sym() means := instead of =
+                   # See the self-determination theory work for Children's
+                   #  Hospital for an example.
+                   summarize(., PTSD = mean(ZPTSD), 
+                             Mood = mean(ZPsych),
+                             CSE = mean(ZCSE),
+                             Shift = mean(ZShift), 
+                             Percd = mean(ZPerceived),
+                             Recd = mean(ZReceived),
+                             Appro = mean(ZApproach),
+                             Avoid = mean(ZAvoid)) %>%
+                   arrange(., desc(Mood)) ->
+  attractor_centers)
+suppressWarnings(NISresults %>%
+                   filter(., CompleteCase == TRUE) %>%
+                   filter(., (Ordering == 1 | Ordering == 0)) %>%
+                   filter(., LengthOK == TRUE) %>%
+                   group_by(., !!sym(solution)) %>%  # !!sym()
+                   summarize(., PTSD = sd(ZPTSD), 
+                             Mood = sd(ZPsych),
+                             CSE = sd(ZCSE),
+                             Shift = sd(ZShift), 
+                             Percd = sd(ZPerceived),
+                             Recd = sd(ZReceived),
+                             Appro = sd(ZApproach),
+                             Avoid = sd(ZAvoid)) %>%
+                   arrange(., desc(Mood)) ->
+  attractor_sd)
+
+as.vector(table(NISresults %>%
+                  filter(., CompleteCase == TRUE) %>%
+                  filter(., (Ordering == 1 | Ordering == 0)) %>%
+                  filter(., LengthOK == TRUE) %>%
+                  select(., knsz.eq.14))) -> attractor_centers$n
+
+round(attractor_centers, 2) -> attractor_centers
+round(attractor_sd, 2) -> attractor_sd
+write.csv(attractor_centers,
+          file = here("Output/attractor_centers.csv"))
+write.csv(attractor_sd,
+          file = here("Output/attractor_sd.csv"))
+
+
+
+#   1    2    3    4    5    6    7    8    9   10   11   12   13 
+#2307   76  922  344  274  132    2   41    2   23    3    1    4 
+#  14 
+#   5 
+
+attractor_centers %>%
+  arrange(., desc(PTSD), desc(Mood)) %>%
+#  mutate(., "Group" = LETTERS[1:14]) -> attractor_centers
+  mutate(., "Group" = c(LETTERS[1:4], "F", "E",
+                        "G", "H", "J", "I", "K", "L", "M", "N")) ->
+  attractor_centers
+
+attractor_centers %>%
+  arrange(., desc(PTSD), desc(Mood)) %>%
+  kable(.,
+        caption = "Cluster Center Z-scores",
+        digits = 2,
+        align = 'r')
+
+write.csv(attractor_centers,
+          file = here("Output/No Shift 14 Centers.csv"))
+```
+
+This is 6 good sized clusters, 2 decent sized ones, and 6 small. I'll use this clustering. The sorting of the pseudo-attractors by health was done by a bubble sort activity: Using the mean Z-scores for the pseudo attractors, and after the bubble sort task, these are in order from most healthy (Cluster A) to least healthy (Cluster M):
+
+Probably should look at the small pseudo-attractor groups via the open ended questions. However, in the spirit of pseudo-attractors, these will be considered transitions. One approach is to simply skip these in the analysis, going from the pseudo-attractor before to the pseudo-attractor afterward. 
+
+It would be interesting to see if any of the transition "states" occurred on a day with a second, and if so, whether or not the hypothesized transience is seen.
+
+Transients in knsz 14-solution: 7, 9, 11:14
+  1    2    3    4    5    6    7    8    9   10   11   12   13   14 
+2307   76  922  344  274  132    2   41    2   23    3    1    4    5 
+```{r transition_seconds, include = FALSE, eval = FALSE}
+NISresults %>%
+  arrange(., ID, Date, Time) -> NISresults
+which(NISresults$knsz.eq.14 %in% 
+        c(7, 9, 11:14)) -> 
+  transient_rows
+sort(unique(c(transient_rows,
+              transient_rows + 1,
+              transient_rows - 1))) -> rows
+NISresults[rows, c("ID", "Date")]
+```
+
+No transient shows up on a day with two responses, so we can't tell if there is an intra-day change for all the presumed transients.
+
+This is using only the responses from people who responded at least 10 times, and the cut at 14 pseudo-attractors. For all variables, higher numbers are considered healthier. (Shift was not used in the clustering process.)
+
+Notice that the following is the correspondence from these numbers to the letters above. (Be sure to adjust this after re-sorting the above!)
+
+```{r}
+LETTERS[1:14] -> pA_labels
+LETTERS[1:14] -> pA_labels[c(13, 14, 9, 11, 3, 8, 1, 2,
+                             5, 4, 6, 10, 12, 7)]
+```
+
+Several other attempts at clustering were used. Only the reduction to using Psych and PTSD only resulted in anything remotely better. Hence, I'll just continue to use the original data for frequent responders.
+
+Now, create the trajectories. The process is:
+
+1. Look at the distribution of members in each pseudo-attractor cluster.
+2. Look at the cluster centers for each pseudo-attractor cluster.
+3. For each cluster, get a distribution of each member's distance from the cluster center
+4. For each participant, create a transition matrix from their cluster memberships.
+5. Cluster the transition matrices into matrix clusters.
+6. Choose, say, 5 clusters.
+7. Look at the distribution of members for each cluster. If decent, then continue. If not, increase the number of matrix clusters by one and repeat this step.
+8. Look at the mean transition matrix for each cluster; do this by looking at the transition networks.
+
+
+Now, create the transition matrices for each participant
+```{r transition_matrices_old, include = FALSE, eval = FALSE}
+#pA_ls[[1]][,c("ID", "Date", "k.eq.13")] -> 
+#  trans_cat                         # Get the required data
+
+#table(trans_cat$ID) -> ID_freq      # Table the ID frequencies
+
+#trans_cat[order(trans_cat$ID,
+#                trans_cat$Date),] -> 
+#  trans_cat                         # Guarantee proper ordering
+
+list() -> trans_ls                  # Create an empty list for the results
+#unique(trans_cat$ID) -> unique_id   # 161 unique ids
+#lapply(unique_id,                   # For each unique ID
+#       make_trans,                  # Make the transition matrix
+#       trans_cat,                   # Use the transition time series
+#       "k.eq.13") -> trans_ls       # 14 nodes.
+```
+
+This is being done just using the firsts; should both firsts and seconds be used?
+```{r transition_matrices}
+any(table(NISresults %>%
+            filter(., CompleteCase == TRUE) %>%
+            filter(., (Ordering == 1 | Ordering == 0)) %>%
+            filter(., LengthOK == TRUE) %>%
+            select(., ID)) < 11)
+## [1] FALSE
+
+NISresults %>%
+  arrange(., ID, Date, Time) %>%
+  filter(., CompleteCase == TRUE) %>%
+  filter(., LengthOK == TRUE) %>%
+  filter(., (Ordering == 1 | Ordering == 0)) %>%
+  # The next !!sym() allows the variable solution, which contains "knsz.eq.14"
+  #  as a chr, to be used in selecting a column.
+  select(., ID, Date, Time, !!sym(solution)) -> trans_cat
+
+list() -> trans_ls                  # Create an empty list for the results
+unique(trans_cat$ID) -> unique_id   # 131 unique ids
+lapply(unique_id,                   # For each unique ID
+       make_trans,                  # Make the transition matrix
+       trans_cat,                   # Use the transition time series
+       "knsz.eq.14") -> trans_ls    # 14 nodes.
+```
+
+Now, there are two things to do, time studies and event-based trajectories.
+Time studies - look for "stuckness" and how that might relate to shift, avoid, etc. Burstiness? Distribution of time in a cluster. How tight are the stuck statistics?
+
+Because it will be helpful, let's add the following columns to trans_cat:
+State-change (from this row to the next) and participant change (from this row to the next). [See also](https://stackoverflow.com/questions/53463398/problem-while-using-group-by-mutate-function-in-r) for a dplyr approach to this stuff.
+```{r add_changes}
+c(diff(trans_cat$knsz.eq.14), -1) -> 
+  trans_cat$dState                      # 0 for no change in state, != 0 for
+                                        #  change in state
+c(diff(trans_cat$ID), -1) -> 
+  trans_cat$ID_Change                   # 0 for no change in ID, != 0 for 
+                                        #  change in ID
+c(as.integer(diff(trans_cat$Date)), 0) -> 
+  trans_cat$dDate                       # Number of days between responses
+
+for(row in 1:nrow(trans_cat)) {     # For each row
+  if(trans_cat$dState[row] != 0) {      # If the state changes...just mark the
+                                        #  change; the value is unimporant:
+    1 -> trans_cat$dState[row]          #  0 for no change, 1 for state change
+  }
+  if(trans_cat$ID_Change[row] != 0) {   # For any time the participant changes:
+    1 -> trans_cat$ID_Change[row]       #  0 for no change, 1 for change in ID.
+    -1 -> trans_cat$dState[row]         #  0 for no change, 1 for change in
+                                        #  state, -1 for indeterminate change.
+    -1 -> trans_cat$dDate[row]          #  Number of days between responses, or
+                                        #   -1 for indeterminate date change.
+  }
+}
+
+# Put these into NISresults
+left_join(NISresults,
+          trans_cat[,c(1:3,5:7)],
+          by = c("ID", "Date", "Time")) -> NISresults
+
+# Remove the seconds: If these are included in the transition
+#  matrices, then remove this section
+# None of these exist:
+# NA -> NISresults$dDate[which(NISresults$Ordering == 2)]
+# One of these exists; it is row 955
+NA -> NISresults$dState[which(NISresults$Ordering == 2 &
+                                NISresults$dState == 1)]
+# None of these exist:
+#NA -> NISresults$dID_Change[which(NISresults$Ordering == 2)]
+```
+
+## Dwell Times
+Look at dwell time in each state and burstiness.
+
+```{r dwell_time}
+trans_cat[order(trans_cat$ID,
+                trans_cat$Date),] -> 
+  trans_cat                         # Guarantee proper ordering
+
+vector() -> event_lengths      # Set up vector for all dwells
+
+# start and stop dates must be done by participant!
+for(participant in unique(trans_cat$ID)) {
+  trans_cat %>%
+    filter(., ID == participant) -> temp_cat
+  c(1,
+    which(temp_cat$dState == 1) + 1) -> start_date_index
+  c(start_date_index[-1],
+    which(temp_cat$dState == -1)) -> stop_date_index
+  for(index in 1:length(stop_date_index)) {
+   c(event_lengths,
+     temp_cat$Date[stop_date_index[index]] -
+       temp_cat$Date[start_date_index[index]]) -> event_lengths
+  }
+  event_lengths[length(event_lengths)] + 1 ->
+    event_lengths[length(event_lengths)] # Correct ending fence post
+}
+
+table(event_lengths)
+mean(event_lengths)            # 4.17
+median(event_lengths)          # 1
+quantile(event_lengths, .75)   # 4
+
+hist(event_lengths,
+     breaks = seq(0.5, 
+                  max(event_lengths) + 0.5,
+                  by = 1),
+     xlab = "Dwell time (days)",
+     main = "Histogram of dwell time in states")
+
+# Power law distribution?
+plot(as.integer(names(table(event_lengths))),
+     table(event_lengths),
+     log = "xy",
+     main = "Log-log plot of dwell time frequencies",
+     xlab = "dwell time",
+     ylab = "frequency")
+
+displ$new(event_lengths) ->
+  events_pl                   # Calculate a power-law fit
+est = estimate_xmin(events_pl)
+events_pl$setXmin(est)
+plot(events_pl)
+
+# A workaround for a parallel error on the bootstrap_p() command. See:
+# https://stackoverflow.com/questions/62730783/error-in-makepsockclusternames-spec-cluster-setup-failed-3-of-3-work
+parallel:::setDefaultClusterOptions(setup_strategy = "sequential")
+
+bootstrap_p(events_pl,
+            threads = 4)
+```
+The data follow a power law reasonably well. (Bootstrap p-value = 0.01.)
+
+How many transitions are there for each participant?
+```{r num_transitions}
+NISresults %>%
+  filter(., (Ordering == 1 | Ordering == 0)) %>% 
+  filter(., CompleteCase == TRUE) %>% 
+  filter(., LengthOK == TRUE) %>%
+  group_by(., ID) %>%
+  summarise("Transitions" = sum(dState) + 1) -> # Account for the (-1)
+  transitions
+table(transitions$Transitions)
+```
+```{r transition_hist}
+hist(transitions$Transitions,
+     breaks = 30)
+```
+
+
+There are 11 of the participants who do not change at all, and 3 who makes only a single transition. Add the static information to the data
+```{r}
+FALSE -> NISresults$Static
+which(transitions$Transitions == 0) -> statics
+TRUE -> NISresults$Static[which(NISresults$ID %in%
+                                  transitions$ID[statics])]
+```
+
+
+We should remove the 11 who do not change from further analysis. These people are all stuck in a single pseudo-attractor. We can check the jitter on their scores later.
+
+### Burstiness
+Can we get burstiness measures from the dwell data? We need only the mean
+and the sd of the inter-event times, which we have. (This does not include the Kim & Jo (2016) adjustment for finite events; we have more than 1200 events so it is okay to omit that, I think.)
+
+```{r burstiness_all}
+vector() -> event_lengths      # Set up vector for all dwells
+
+unique(NISresults %>%
+       filter(., (Ordering == 1 | Ordering == 0)) %>%
+       filter(., LengthOK == TRUE) %>%
+       filter(., CompleteCase == TRUE) %>%
+       select(., ID)) -> 
+  participants
+# start and stop dates must be done by participant!
+for(participant in participants$ID) {
+  NISresults %>%
+    filter(., (Ordering == 1 | Ordering == 0)) %>%
+    filter(., LengthOK == TRUE) %>%
+    filter(., CompleteCase == TRUE) %>%
+    filter(., ID == participant) %>%
+    select(., dState, Date) -> temp_cat
+  c(1,
+    which(temp_cat$dState == 1) + 1) -> start_date_index
+  c(start_date_index[-1],
+    which(temp_cat$dState == -1)) -> stop_date_index
+  for(index in 1:length(stop_date_index)) {
+   c(event_lengths,
+     temp_cat$Date[stop_date_index[index]] -
+       temp_cat$Date[start_date_index[index]]) -> event_lengths
+  }
+  event_lengths[length(event_lengths)] + 1 ->
+    event_lengths[length(event_lengths)] # Correct ending fence post
+}
+
+(sd(event_lengths) - mean(event_lengths)) / 
+   (sd(event_lengths) + mean(event_lengths))
+```
+Removing statics:
+```{r burstiness_no_statics}
+vector() -> event_lengths      # Set up vector for all dwells
+
+unique(NISresults %>%
+       filter(., (Ordering == 1 | Ordering == 0)) %>%
+       filter(., LengthOK == TRUE) %>%
+       filter(., CompleteCase == TRUE) %>%
+       filter(., Static == FALSE) %>%
+       select(., ID)) -> 
+  participants
+# start and stop dates must be done by participant!
+for(participant in participants$ID) {
+  NISresults %>%
+    filter(., (Ordering == 1 | Ordering == 0)) %>%
+    filter(., LengthOK == TRUE) %>%
+    filter(., CompleteCase == TRUE) %>%
+    filter(., ID == participant) %>%
+    select(., dState, Date) -> temp_cat
+  c(1,
+    which(temp_cat$dState == 1) + 1) -> start_date_index
+  c(start_date_index[-1],
+    which(temp_cat$dState == -1)) -> stop_date_index
+  for(index in 1:length(stop_date_index)) {
+   c(event_lengths,
+     temp_cat$Date[stop_date_index[index]] -
+       temp_cat$Date[start_date_index[index]]) -> event_lengths
+  }
+  event_lengths[length(event_lengths)] + 1 ->
+    event_lengths[length(event_lengths)] # Correct ending fence post
+}
+
+(sd(event_lengths) - mean(event_lengths)) / 
+   (sd(event_lengths) + mean(event_lengths))
+```
+
+A burstiness coefficient of 0.257, which corresponds to some burstiness; the value is 0.212 when the static trajectories are excluded. (-1 is regular (i.e., sd() = 0), 0 is random (i.e., sd() = mean(), so Poisson), and 1 is extreme burstiness (i.e., in the limit, mean() << sd().) What does it mean that we find some burstiness in these data? Answer: Well, first off, the data are not simply random, but instead, there is some feedback going on. What does this mean about the dynamics, though?
+
+Could we use the Kim & Jo adjustment to do a burstiness coefficient for each participant? To what effect?
+
+We could bootstrap the burstiness to get a confidence interval, but for now, I'll leave this.
+
+We should do dwell-time statistics by trajectory and state, too.
+
+### Static Trajectories
+Which ones were static? What state were they in?
+```{r staticTrajectories}
+as.vector(
+  unique(NISresults %>%
+       filter(., Static == TRUE) %>%
+       select(., ID))) ->
+  static_participants
+static_participants
+NISresults$knsz.eq.14[which(NISresults$ID %in% static_participants$ID)]
+# All are "1" except one participant is in "4".
+table(NISresults$knsz.eq.14)
+```
+
+
+# Trajectories
+Event-based transitions for trajectories is easily accomplished: Set the diag() to zero for each transition matrix, re-normalize, and cluster from there.
+
+Cluster the transition matrices. For now, we'll ignore the weights (available from ID_freq). unique_id and trans_ls are sorted in the same order right now.
+```{r event_based_trajectories}
+for(i in 1:length(trans_ls)) {
+  0 -> diag(trans_ls[[i]])       # Remove self-transitions
+}
+
+# Remove those who have no transitions. This doesn't seem to take
+#  care of the last one in the list, however, so let's do that one
+#  separately. (That's a fencepost error from above)
+which(sapply(trans_ls, sum) == 0) -> ls_rem
+##  [1]  10  14  49  55  64  69  74  77  87 115 131
+##NULL -> trans_ls[[121]]   # Fencepost error from above
+
+### trans_cat[-which(trans_cat$ID %in% unique_id[ls_rem]),] ->
+###     trans_cat_red
+### NIS_Data_red[-which(trans_cat$ID %in% unique_id[ls_rem]),] ->
+###   NIS_Data_short   # Will need later
+
+parDist(trans_ls[-ls_rem],   # Cluster all matrices with transitions
+        diag = TRUE,
+        upper = TRUE) -> distances  # Distances between matrices
+hclust(distances,
+       method = "average") -> mat_clust
+#sort(unique((NISresults %>%
+#               filter(., LengthOK == TRUE) %>%
+#               filter(., !ID %in%  participants$ID[ls_rem]) %>%
+#               select(., ID))$ID)) -> 
+#  mat_clust$labels
+unique_id[-ls_rem] ->
+  mat_clust$labels
+
+# The single method produces clusters which slowly grow, resulting
+#  in a big cluster and multiple singletons which slowly get agglomerated.
+#
+# Ward's method (ward.D2) produces much more evenly distributed clusters.
+#
+# Because we are working with complex systems, I don't expect even clusters.
+
+# 1.3
+##  4 14  1  8 10 15  7  9 11 13 
+## 49 11  5  5  4  4  3  3  3  2 
+
+# 1.4
+##  4 13  1  7  8 14  9 10 11 17 
+## 50 12  5  5  5  5  4  4  3  3
+
+# 1.45
+##  1  9  6  7  8 10 14 13 22  2 
+## 60 16  6  5  4  3  3  2  2  1 
+
+1.45 -> cut_try  # trial and error found this one for "average"
+{
+  plot(mat_clust, 
+       hang = -1,
+       labels = NULL,
+       main = "Clustering of Transition Matrices")
+  abline(h = cut_try,
+         col = "darkgreen",
+         lwd = 2)
+}
+
+cutree(mat_clust, 
+       h = cut_try) -> 
+  clust_membership_145
+table(clust_membership_145) -> 
+  cluster_tbl
+cluster_tbl
+head(sort(cluster_tbl,
+          decreasing = TRUE), 
+     10)
+```
+
+It isn't clear which one to choose, but all of the candidates have 4 to 6 "large" clusters that account for more than half of the data. Choosing a cut point of 1.3 or 1.45 seems to be the most useful, as 1.3 produces a 49-11-5-5-smaller distribution and 1.45 produces a 60-16-6-5-smaller distribution. 87/120 = 72.5% of the participants are in one of these 4 clusters.
+
+Let's work with 1.45. 
+```{r}
+# Add the trajectories to NISresults
+rep(as.character(NA), nrow(NISresults)) -> 
+  NISresults$Trajectory_145
+for(row in 1:nrow(NISresults)) {
+  if(
+    length(
+      clust_membership_145[
+        which(
+          names(clust_membership_145) == 
+          as.character(NISresults$ID[row]) )]) > 0) { 
+    clust_membership_145[which(
+      names(clust_membership_145) == as.character(NISresults$ID[row]) )] ->
+      NISresults$Trajectory_145[row]
+  }
+}
+as.integer(NISresults$Trajectory_145) -> NISresults$Trajectory_145
+
+sum(table(NISresults %>%
+            filter(., dState == 0 | dState == 1) %>%
+            select(., Trajectory_145)))
+table(NISresults %>%
+            filter(., dState == 0 | dState == 1) %>%
+            select(., Trajectory_145))
+```
+(1753 + 193 + 168 + 545) = 2659 of the 3687 of the rows are in clusters 1, 6, 7, 9. That's 0.721.
+
+Here are the calculations for a cut at 1.3
+```{r}
+cutree(mat_clust, 
+       h = 1.3) -> 
+  clust_membership_13
+
+# Add the trajectories to NISresults
+rep(as.character(NA), nrow(NISresults)) -> 
+  NISresults$Trajectory_13
+for(row in 1:nrow(NISresults)) {
+  if(
+    length(
+      clust_membership_13[
+        which(
+          names(clust_membership_13) == 
+          as.character(NISresults$ID[row]) )]) > 0) { 
+    clust_membership_13[which(
+      names(clust_membership_13) == as.character(NISresults$ID[row]) )] ->
+      NISresults$Trajectory_13[row]
+  }
+}
+as.integer(NISresults$Trajectory_13) -> NISresults$Trajectory_13
+```
+
+
+A BPR thought: Do we know what percentage of the participants (and if so, which ones) "never recovered" (or, in the extreme, devolved into suicide or some permanent state of depression, etc.)? Do the "never recovered" participants show up as the four who are quite different from the rest?
+
+We have the following information about each of the 114 trajectories (each of these variables is sorted in the same order):
+
+- Transition matrix (probability of each type of transition) (trans_ls)
+- Number of transitions for each trajectory (SID_freq)
+- Participant and study identifier (unique_id)
+- Which trajectory cluster the trajectory is in (clust_membership)
+
+- For purposes of better qgraph() plotting, make an edgelist with columns from, to, and width
+
+```{r trajectory_matrices}
+NISresults %>%
+  filter(., Trajectory_145 == 1) -> traj_1
+NISresults %>%
+  filter(., Trajectory_145 == 6) -> traj_2
+NISresults %>%
+  filter(., Trajectory_145 == 7) -> traj_3
+NISresults %>%
+  filter(., Trajectory_145 == 9) -> traj_4
+
+matrix(0,nrow = 14, ncol = 14) -> 
+  transitions_1 ->
+  transitions_2 ->
+  transitions_3 ->
+  transitions_4
+pA_labels -> colnames(transitions_1) ->
+  rownames(transitions_1) ->
+  colnames(transitions_2) ->
+  rownames(transitions_2) ->
+  colnames(transitions_3) ->
+  rownames(transitions_3) ->
+  colnames(transitions_4) ->
+  rownames(transitions_4)
+
+for(id in unique(traj_1$ID)) {
+  traj_1 %>%
+    filter(., ID == id) %>%
+    select(., !!sym(solution)) -> ts
+  ts[,which(colnames(ts) == solution)] -> ts
+  ts[-1] -> ts1
+  for(index in 1:(length(ts)-1)) {
+    transitions_1[ts[index],ts1[index]] + 1 ->
+      transitions_1[ts[index],ts1[index]]
+  }
+}
+0 -> diag(transitions_1)
+as_data_frame(
+  graph_from_adjacency_matrix(transitions_1, weighted = TRUE),
+  what = "edges") ->
+  edgelist_1
+sqrt(edgelist_1$weight) -> edgelist_1$weight
+
+for(id in unique(traj_2$ID)) {
+  traj_2 %>%
+    filter(., ID == id) %>%
+    select(., !!sym(solution)) -> ts
+  ts[,which(colnames(ts) == solution)] -> ts
+  ts[-1] -> ts2
+  for(index in 1:(length(ts)-1)) {
+    transitions_2[ts[index],ts2[index]] + 1 ->
+      transitions_2[ts[index],ts2[index]]
+  }
+}
+0 -> diag(transitions_2)
+as_data_frame(
+  graph_from_adjacency_matrix(transitions_2, weighted = TRUE),
+  what = "edges") ->
+  edgelist_2
+
+for(id in unique(traj_3$ID)) {
+  traj_3 %>%
+    filter(., ID == id) %>%
+    select(., !!sym(solution)) -> ts
+  ts[,which(colnames(ts) == solution)] -> ts
+  ts[-1] -> ts3
+  for(index in 1:(length(ts)-1)) {
+    transitions_3[ts[index],ts3[index]] + 1 ->
+      transitions_3[ts[index],ts3[index]]
+  }
+}
+0 -> diag(transitions_3)
+as_data_frame(
+  graph_from_adjacency_matrix(transitions_3, weighted = TRUE),
+  what = "edges") ->
+  edgelist_3
+
+for(id in unique(traj_4$ID)) {
+  traj_4 %>%
+    filter(., ID == id) %>%
+    select(., !!sym(solution)) -> ts
+  ts[,which(colnames(ts) == solution)] -> ts
+  ts[-1] -> ts4
+  for(index in 1:(length(ts)-1)) {
+    transitions_4[ts[index],ts4[index]] + 1 ->
+      transitions_4[ts[index],ts4[index]]
+  }
+}
+0 -> diag(transitions_4)
+as_data_frame(
+  graph_from_adjacency_matrix(transitions_4, weighted = TRUE),
+  what = "edges") ->
+  edgelist_4
+
+```
+
+OK, we have the transition matrices. Check to make sure that these have split appropriately.
+
+```{r}
+NISresults %>%
+  select(., ID, Trajectory_145) %>%
+  filter(., Trajectory_145 %in% c(1, 6, 7, 9)) -> dum1
+  length(unique(dum1$ID))
+with(dum1, table(Trajectory_145, ID))
+```
+These split appropriately.
+
+```{r trajectory_pops}
+with(dum1, table(Trajectory_145, ID)) -> traj_id
+length(which(traj_id[1,] > 0))
+length(which(traj_id[2,] > 0))
+length(which(traj_id[3,] > 0))
+length(which(traj_id[4,] > 0))
+```
+
+
+Plots still need some work. Sigh. I'll do the plots in a separate PostScript file. (Eventually, I'll integrate that file with the results here.)
+
+First, look at the number of transitions, and whether or not the transitions are linked to the outcomes.
+
+Trajectory names:
+1 - mostly stable adjustment pattern trajectory
+6 - unstable adjustment pattern with active recovery efforts trajectory
+7 - less successful recovery efforts trajectory
+9 - fluctuating adjustment trajectory
+
+
+```{r trajectory_statistics}
+# Six month outcomes by group
+NISresults %>%
+  filter(., Trajectory_145 %in% c(1, 6, 7, 9)) %>%
+  group_by(., Trajectory_145) %>%
+  summarize(., "Six month outcome means" = 
+              mean(PCL_Total_T3, na.rm = TRUE),
+            "Six month outcome sd" = 
+              sd(PCL_Total_T3, na.rm = TRUE),
+             "Baseline outcome means" = 
+              mean(PCL_Total_T1, na.rm = TRUE),
+            "Baseline outcome sd" = 
+              sd(PCL_Total_T1, na.rm = TRUE)
+            )
+
+NISresults %>%
+  filter(., Trajectory_145 %in% c(1, 6, 7, 9)) %>%
+  select(., c(ID, PCL_Total_T1, PCL_Total_T2,
+              PCL_Total_T3, Trajectory_145)) %>%
+  filter(., !duplicated(NISresults %>%
+    filter(., Trajectory_145 %in% c(1, 6, 7, 9)) %>%
+    select(., c(ID, PCL_Total_T1, PCL_Total_T2,
+                PCL_Total_T3, Trajectory_145)))) %>%
+  mutate(., delta3 = PCL_Total_T2 - PCL_Total_T1) %>%
+  mutate(., delta6 = PCL_Total_T3 - PCL_Total_T1) ->
+  aov_trans_df
+```
+
+
+```{r}
+# Differences in baseline outcomes
+aovp(PCL_Total_T1 ~ as.factor(Trajectory_145), data = aov_trans_df) ->
+  traj_aov
+summary(traj_aov)
+TukeyHSD(traj_aov)
+
+# Bootstrap aovp() follow-up:
+summary(
+  aovp(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 1 | Trajectory_145 == 6)))
+summary(
+  aovp(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 1 | Trajectory_145 == 7)))
+summary(
+  aovp(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 1 | Trajectory_145 == 9)))
+summary(
+  aovp(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 6 | Trajectory_145 == 7)))
+summary(
+  aovp(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 6 | Trajectory_145 == 9)))
+summary(
+  aovp(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 7 | Trajectory_145 == 9)))
+```
+
+
+```{r baselineDifferencesViaWilcox}
+# Differences in baseline outcomes
+kruskal.test(PCL_Total_T1 ~ as.factor(Trajectory_145),
+             data = aov_trans_df) 
+
+# Kruskal-Wallis follow-up (don't forget Bonferroni!):
+wilcox.test(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+     data = aov_trans_df %>% 
+       filter(., Trajectory_145 == 1 | Trajectory_145 == 6))
+wilcox.test(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+      data = aov_trans_df %>% 
+       filter(., Trajectory_145 == 1 | Trajectory_145 == 7))
+wilcox.test(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 1 | Trajectory_145 == 9))
+wilcox.test(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 6 | Trajectory_145 == 7))
+wilcox.test(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 6 | Trajectory_145 == 9))
+wilcox.test(PCL_Total_T1 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 7 | Trajectory_145 == 9))
+```
+
+```{r SixMonthDifferencesViaWilcox}
+# Differences in 6-month outcomes
+kruskal.test(PCL_Total_T3 ~ as.factor(Trajectory_145),
+             data = aov_trans_df) 
+
+# Kruskal-Wallis follow-up (don't forget Bonferroni!):
+wilcox.test(PCL_Total_T3 ~ as.factor(Trajectory_145), 
+     data = aov_trans_df %>% 
+       filter(., Trajectory_145 == 1 | Trajectory_145 == 6))
+wilcox.test(PCL_Total_T3 ~ as.factor(Trajectory_145), 
+      data = aov_trans_df %>% 
+       filter(., Trajectory_145 == 1 | Trajectory_145 == 7))
+wilcox.test(PCL_Total_T3 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 1 | Trajectory_145 == 9))
+wilcox.test(PCL_Total_T3 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 6 | Trajectory_145 == 7))
+wilcox.test(PCL_Total_T3 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 6 | Trajectory_145 == 9))
+wilcox.test(PCL_Total_T3 ~ as.factor(Trajectory_145), 
+       data = aov_trans_df %>% 
+         filter(., Trajectory_145 == 7 | Trajectory_145 == 9))
+```
+
+```{r baseline_to_six}
+wilcox.test(x = aov_trans_df$PCL_Total_T1, 
+            y = aov_trans_df$PCL_Total_T3,
+            paired = TRUE,
+            alternative = "two.sided")
+```
+
+
+```{r}
+# Differences in three month outcomes
+aovp(PCL_Total_T2 ~ as.factor(Trajectory_145), data = aov_trans_df) ->
+  traj_aov
+traj_aov
+summary(traj_aov)
+TukeyHSD(traj_aov)
+
+# Differences in six month outcomes
+aovp(PCL_Total_T3 ~ as.factor(Trajectory_145), data = aov_trans_df) ->
+  traj_aov
+traj_aov
+summary(traj_aov)
+TukeyHSD(traj_aov)
+
+# Differences in three month outcomes, normalized by start
+aovp(delta3 ~ as.factor(Trajectory_145), data = aov_trans_df) ->
+  traj_aov
+traj_aov
+summary(traj_aov)
+TukeyHSD(traj_aov)
+
+# Differences in six month outcomes, normalized by start
+aovp(delta6 ~ as.factor(Trajectory_145), data = aov_trans_df) ->
+  traj_aov
+summary(traj_aov)
+TukeyHSD(traj_aov)
+
+# Number of transitions by trajectory
+NISresults%>%
+  filter(., Trajectory_145 %in% c(1, 6, 7, 9)) %>%
+  filter(., dState == 1 & dDate == 1) %>%
+  select(., c(Trajectory_145, ID,
+              Static, PCL_Total_T1, PCL_Total_T2,
+              PCL_Total_T3)) %>%
+  group_by(., Trajectory_145, ID) %>%
+  summarise(., "NumTransitions" = n()) %>%
+  ungroup() -> numtrans_df
+
+# Mean & SD of number of transitions by trajectory
+numtrans_df %>%
+  group_by(., Trajectory_145) %>%
+  summarise(., "Mean Num Transitions" = 
+              mean(NumTransitions, na.rm = TRUE),
+             "SD Num Transitions" = 
+              sd(NumTransitions, na.rm = TRUE))
+
+kruskal.test(NumTransitions ~ as.factor(Trajectory_145),
+     data = numtrans_df) -> trans_aov
+summary(trans_aov)
+#TukeyHSD(trans_aov)
+```
+
+```{r}
+data.frame("PTSD" = c(aov_trans_df$PCL_Total_T1,
+                      aov_trans_df$PCL_Total_T2,
+                      aov_trans_df$PCL_Total_T3),
+           "Time" = rep(c(1,2,3),
+                        each = nrow(aov_trans_df))) -> delta_df
+aovp(PTSD ~ Time,
+     data = delta_df %>%
+       filter(., Time == 1 | Time == 2)) -> delta_12_aovp
+summary(delta_12_aovp)
+aovp(PTSD ~ Time,
+     data = delta_df %>%
+       filter(., Time == 1 | Time == 3)) -> delta_13_aovp
+summary(delta_13_aovp)
+```
+
+Trajectory network plots:
+
+- Remove the transient rows and columns (A:D and M:N).
+- For each trajectory (transitions_1, transitions_2, etc.), remove the rows and columns that are all zeros. (Make sure the matrix is still square.)
+- Create the graph
+- Compress the remaining data (via square- or cube-root) to determine the widths
+- Adjust the signs so as to get curves positive or negative
+- Adjust the line types to get solid or dashed
+```{r transitionPlots, include = FALSE}
+set.seed(1)
+sample_pa(8) -> dum1
+0.35 -> h1
+setwd("/Users/barneyricca/Desktop")
+tiff(filename = "Plot1.tif",
+     width = 1920,
+     height = 1920,
+     compression = "none")
+{
+  plot(dum1, 
+       layout = layout_in_circle(dum1),
+       vertex.size = 30,
+       vertex.color = "#ffffff",
+       vertex.frame.color = "#000000",
+       vertex.label.cex = 3,
+       vertex.label = paste("H = ", h1, "\n", "S = ", h1),
+#       edge.curved = c(0.4, 0.3, 0.2, 0.1, -0.1, -0.2, -0.3),
+       edge.arrow.size = 2.3,
+#       edge.lty = c(1, 1, 1, 1, 2, 2, 2),
+       edge.width = 10.5)
+}
+dev.off()
+```
+
+
+First, for the first one (with the old nomenclature added):
+
+```{r}
+nodes_1
+pA_labels
+```
+
+  1   2   3   4   5   6   8 
+143   2  26   8  13   4   3 
+E     F   G   H   I   J   L
+
+Now, the transition matrix
+
+```{r network_plots, eval = FALSE}
+table(NISresults %>%
+        filter(., Trajectory_145 == 1) %>%
+        select(., !!sym(solution))) -> 
+        nodes_1
+qgraph(transitions_1[as.integer(names(nodes_1)),
+                     as.integer(names(nodes_1))],
+       layout = "circle",
+       minimum = 1,
+       vsize = 2 * (nodes_1 ^ (1/3)))
+
+qgraph(edgelist_1, 
+       mode = "direct",
+       layout = "circle",
+       vsize = 2 * (nodes_1 ^ (1/3)))
+
+table(NISresults %>%
+        filter(., Trajectory_145 == 6) %>%
+        select(., !!sym(solution))) -> 
+        nodes_2
+qgraph(transitions_2[as.integer(names(nodes_2)),
+                     as.integer(names(nodes_2))],
+       layout = "circle",
+       minimum = 1,
+       vsize = 2 * (nodes_2 ^ (1/3)))
+
+table(NISresults %>%
+        filter(., Trajectory_145 == 7) %>%
+        select(., !!sym(solution))) -> 
+        nodes_3
+qgraph(transitions_3[as.integer(names(nodes_3)),
+                     as.integer(names(nodes_3))],
+       layout = "circle",
+       minimum = 1,
+       vsize = 2 * (nodes_3 ^ (1/3)))
+
+table(NISresults %>%
+        filter(., Trajectory_145 == 9) %>%
+        select(., !!sym(solution))) -> 
+        nodes_4
+qgraph(transitions_4[as.integer(names(nodes_4)),
+                     as.integer(names(nodes_4))],
+       layout = "circle",
+       minimum = 1,
+       vsize = 2 * (nodes_4 ^ (1/3)))
+
+```
+
+# To do
+
+## Significant Differences
+Compare the various groups (e.g., statics vs dynamics; too short vs. long enough; seconds vs. firsts) on the various measures and test for significance.
+
+## Other Clusters
+Perhaps use fewer of the instruments in clustering, based on the type of variable and what it measures.
+Psych - measure of health (endogenous variable)
+PTSD - measure of health (endogenous variable)
+CSE -
+Avoidance Coping -
+Approach Coping - 
+Received Support - (exogenous variable)
+Perceived Support - 
+Cognitive Shift - Measures likelihood of downward shift; does not measure health (endogenous variable)
+
+# New Idea:
+a) Is a state change more likely for less healthy values of Shift?
+b) How does dwell time depend on Shift?
+c) How does dwell time depend on a drop in Shift?
+d) How does dwell time depend on an intraday drop in Shift?
+
+```{r shift_df, eval = FALSE}
+# Classify knsz.eq.14 for the seconds (Ordering == 2).
+vector(mode = "numeric",
+       length = max(NISresults$knsz.eq.14,
+                    na.rm = TRUE)) ->
+  center_dist
+NISresults %>%
+  relocate(ZCSE, .before = ZPerceived) %>%
+  relocate(ZReceived, .after = ZAvoid) -> NISresults
+
+for(row in 1:nrow(NISresults)) {
+  if(NISresults$Ordering[row] == 2 & 
+     NISresults$CompleteCase[row] == TRUE &
+     NISresults$LengthOK[row] == TRUE) {
+    for(attractor in 1:nrow(attractor_centers)) {
+      sqrt(sum((NISresults[row,67:73] -
+              attractor_centers[attractor,2:8]) ^ 2)) -> center_dist[attractor]
+    }
+    attractor_centers$knsz.eq.14[which(center_dist == min(center_dist))] ->
+      NISresults$knsz.eq.14[row]
+  }
+}
+
+NISresults %>%
+  filter(., CompleteCase == TRUE) %>%
+  filter(., LengthOK == TRUE) %>%
+  filter(., Static == FALSE) %>%
+  select(., all_of(c("Shift", "knsz.eq.14", "Date", "Time", "Static",
+                     "dState", "dDate", "Trajectory_145",
+                     "ID_Change", "Ordering", "ID"))) %>%
+    arrange(., ID, Date, Time) -> shift_df
+
+# Because all of the recalculations will screw up the original work, we will 
+#  do them here rather than on NISresults.
+# Recalculate ID_Change to account for the seconds
+# Recalculate dDate to account for the seconds
+# Recalculate dState to account for the seconds.
+c(diff(shift_df$knsz.eq.14), -1) -> 
+  shift_df$dState                      # 0 for no change in state, != 0 for
+                                        #  change in state
+c(diff(shift_df$ID), -1) -> 
+  shift_df$ID_Change                   # 0 for no change in ID, != 0 for 
+                                        #  change in ID
+c(as.integer(diff(shift_df$Date)), 0) -> 
+  shift_df$dDate                       # Number of days between responses
+
+for(row in 1:nrow(shift_df)) {     # For each row
+  if(shift_df$dState[row] != 0) {      # If the state changes...just mark the
+                                        #  change; the value is unimporant:
+    1 -> shift_df$dState[row]          #  0 for no change, 1 for state change
+  }
+  if(shift_df$ID_Change[row] != 0) {   # For any time the participant changes:
+    1 -> shift_df$ID_Change[row]       #  0 for no change, 1 for change in ID.
+    -1 -> shift_df$dState[row]         #  0 for no change, 1 for change in
+                                        #  state, -1 for indeterminate change.
+    -1 -> shift_df$dDate[row]          #  Number of days between responses, or
+                                        #   -1 for indeterminate date change.
+  }
+}
+
+shift_df %>%
+  filter(., Static == FALSE) %>%
+  filter(., dDate != -1) %>%
+  select(., dState, dDate) %>%
+  table() -> ds_tab
+chisq.test(matrix(c(ds_tab[1,1], sum(ds_tab[1,2:ncol(ds_tab)]),
+                    ds_tab[2,1], sum(ds_tab[2,2:ncol(ds_tab)])),
+                  nrow = 2,
+                  ncol = 2,
+                  byrow = TRUE))
+```
+Hmm..a chi-squared test indicates that change in date (0 or not) and change in state (no or yes) are not independent of each other, and that there is more likely to be a change in state across days than on the same day. (Further evidence that intra-day changes are not as common as inter-day changes.)
+
+
+Hmm..should the trajectory be recalculated after including the seconds?
+If there aren't a lot of problems (e.g., intraday state changes) then skip this.
+```{r dState_vs_shift, eval = FALSE}
+# This is a logistic regression with an ordinal predictor (because factShift
+#  is ordinal)
+# a) Is a state change more likely for less healthy values of Shift?
+shift_df %>%
+  filter(., dState != -1) %>%
+  mutate(., factShift = as.factor(Shift)) %>%
+glm(dState ~ factShift,
+    data = .,
+    family = "binomial") -> # logistic regression
+  state_logm
+summary(state_logm)
+
+# Reduce shift_df by going to event based and using the average Shift value
+#  for the event. 
+
+# Also
+# b) How does dwell time depend on Shift?
+lm(dwell ~ avShift,
+   data = red_shift_df) -> 
+  dwell_lm
+summary(dwell_lm)
+
+# c) How does dwell time depend on a drop in Shift? That is, after a drop in Shift, the dwell time will be less than if there was no drop, but what about a rise in shift?
+
+# d) How does dwell time depend on an intra-day drop in Shift?
+
+```
+The glm model indicates that a shift between states is more likely the lower the value of the Shift. (Elsewhere we determined that lower Shift values are more likely to lead to lower Psych and PTSD results.) Notice that most Shift values are either 0 or 3; this is part of the reason why the estimates for values of 1 and 2 are non-significant. (The other is that the ratio of no-state-change to state-change is roughly similar for Shift values of 0, 1, and 2: 1.06, 1.1, and 1.18, respectively. The ratio for Shift values of 3 is 1.91.)
+```{r, eval = FALSE}
+table(shift_df$Shift)
+table(shift_df$Shift, shift_df$dState)
+```
+
+
+# Old Stuff (Discards)
+OK, having done a bunch of exploratory stuff, let's create a transition network. Here's what we will do:
+
+1. Combine NIS Days A and B into a single data set, taking care to deal with the alternating days in the NIS.
+2. Recalculate Z-scores for survey results. (The CSE will have to be considered carefully because in the NIS they are split into two. Scale everything appropriately.) 
+3. Create clusters, and summarize the instruments (mean and standard deviation) for each cluster.
+4. Choose a number of clusters from which to create transition networks.
+
+
+Combine scores into their instruments. Do something for the A and B day.
+
+Create the instruments first, and then go to Z-scores.
+```{r prepareDataForClustering, eval = FALSE, include = FALSE}
+# Load the original data and process, using the raw scores (without
+#  converting to Z-scores; scaling comes last).
+#load(here("Data/NISSurveyData.RData"))
+#load(here("Data/NISSurveyDataSeconds.RData"))
+load("./Data/NISSurveyData.RData")
+load("./Data/NISSurveyDataSeconds.RData")
+
+# Clean the data: Get rid of incomplete cases:
+# For the NIS, split the days, and deal with each set separately
+# Psych, PTSD, Perceived, Received, CSE, Coping & Avoidance Coping, Cog Shift
+#save(NIS_Z_Data, file = here("Data/NIS_Z_Data.RData"))
+save(NIS_Z_Data, file = "./Data/NIS_Z_Data.RData")
+
+
+
+
+# Clean the seconds data: Get rid of incomplete cases:
+# For the NIS, split the days, and deal with each set separately
+# Psych, PTSD, Perceived, Received, CSE, Coping & Avoidance Coping, Cog Shift
+NISSeconds[which(!is.na(NISSeconds$emotions)),
+           c(7:10, 11:15, 16:18, 19:21, 22:25, 26:29, 
+             30:32, 1:3)] -> NIS_Seconds_A
+# Psych, PTSD, Perceived, Received, CSE, Coping & Avoidance Coping, Cog Shift
+NISSeconds[which(!is.na(NISSeconds$normal)),
+           c(33:36, 53:57, 37:39, 43:45, 46:48, 49:52,
+             40:42, 1:3)] -> NIS_Seconds_B
+
+# These get to neither A nor B:
+# 76, 115, 180, 306
+# These are very incomplete.
+
+# Clean the data: Get rid of incomplete cases:
+which(complete.cases(NIS_Seconds_A[,1:26]) == FALSE) -> bad_cases # By row
+##  [1]    5   30   32
+NIS_Seconds_A[-bad_cases,] -> NIS_Seconds_A
+
+which(complete.cases(NIS_Seconds_B[,1:25]) == FALSE) -> bad_cases # By row
+##  [1]   25  145
+NIS_Seconds_B[-bad_cases,] -> NIS_Seconds_B
+
+# Create the instrument values for NISSeconds A Days
+unname(apply(NIS_Seconds_A[,1:4], 1, sum)) -> Psych
+unname(apply(NIS_Seconds_A[,5:9], 1, sum)) -> PTSD
+unname(apply(NIS_Seconds_A[10:12], 1, sum)) -> Perceived
+unname(apply(NIS_Seconds_A[13:15], 1, sum)) -> Received
+(7/4) * unname(apply(NIS_Seconds_A[,16:19], 1, sum)) -> 
+  CSE # A days have 4 items from the CSE instrument
+unname(apply(NIS_Seconds_A[,20:21], 1, sum)) -> Approach
+unname(apply(NIS_Seconds_A[,22:23], 1, sum)) -> Avoid
+unname(apply(NIS_Seconds_A[,24:26], 1, sum)) -> Shift
+data.frame("ID" = NIS_Seconds_A$StudyID,
+           "Study" = rep("NIS", nrow(NIS_Seconds_A)),
+           "Day" = rep("A", nrow(NIS_Seconds_A)),
+           "Date" = NIS_Seconds_A$`Notification Date`,
+           "Time" = NIS_Seconds_A$`Notification Time`,
+           "Psych" = Psych,
+           "PTSD" = PTSD,
+           "CSE" = CSE,
+           "Shift" = Shift,
+           "Approach" = Approach,
+           "Avoid" = Avoid,
+           "Perceived" = Perceived,
+           "Received" = Received) -> Seconds1
+
+# Create the instrument values for NISSeconds B Days
+unname(apply(NIS_Seconds_B[,1:4], 1, sum)) -> Psych
+unname(apply(NIS_Seconds_B[,5:9], 1, sum)) -> PTSD
+unname(apply(NIS_Seconds_B[10:12], 1, sum)) -> Perceived
+unname(apply(NIS_Seconds_B[13:15], 1, sum)) -> Received
+(7/3) * unname(apply(NIS_Seconds_B[,16:18], 1, sum)) -> 
+  CSE # B days have 3 items from the CSE instrument
+unname(apply(NIS_Seconds_B[,19:20], 1, sum)) -> Approach
+unname(apply(NIS_Seconds_B[,21:22], 1, sum)) -> Avoid
+unname(apply(NIS_Seconds_B[,23:25], 1, sum)) -> Shift
+
+data.frame("ID" = NIS_Seconds_B$StudyID,
+           "Study" = rep("NIS", nrow(NIS_Seconds_B)),
+           "Day" = rep("B", nrow(NIS_Seconds_B)),
+           "Date" = NIS_Seconds_B$`Notification Date`,
+           "Time" = NIS_Seconds_B$`Notification Time`,
+           "Psych" = Psych,
+           "PTSD" = PTSD,
+           "CSE" = CSE,
+           "Shift" = Shift,
+           "Approach" = Approach,
+           "Avoid" = Avoid,
+           "Perceived" = Perceived,
+           "Received" = Received) -> Seconds2
+
+rbind(Seconds1, Seconds2) -> NIS_Seconds
+which(complete.cases(NIS_Seconds) == FALSE) -> bad_data
+# None!
+#save(NIS_Seconds, file = here("Data/NISSeconds.RData"))
+save(NIS_Seconds, file = "./Data/NISSeconds.RData")
+NIS_Seconds -> NIS_Z_Seconds
+scale(NIS_Seconds[,6:13]) -> NIS_Z_Seconds[,6:13]
+#save(NIS_Z_Seconds, file = here("Data/NIS_Z_Seconds.RData"))
+save(NIS_Z_Seconds, file = "./Data/NIS_Z_Seconds.RData")
+
+```
+_NISData.RData_ has the instrument scores. _NIS_Z_Data.RData_ has the instrument Z-scores.
+_NISSeconds.RData_ has the repeated (gltichy) instrument scores. _NIS_Z_Seconds.RData_ has the repeated (glitchy) instrument Z-scores.
+
+## EDA
+Some EDA on the data.
+```{r NIS_EDA2, eval = FALSE}
+#load(here("Data/NISData.RData"))
+load("./Data/NISData.RData")
+apply(NIS_Data[6:13], 2, intEDA) -> res_summ
+t(res_summ) -> res_summ
+c("Mean", "sd", "Median", "MAD", "Min", "Max", "Missing") -> colnames(res_summ)
+kable(res_summ,
+      digits = 2,
+      caption = "NIS Summary")
+
+#load(here("Data/NISSeconds.RData"))
+load("./Data/NISSeconds.RData")
+apply(NIS_Seconds[6:13], 2, intEDA) -> res_summ
+t(res_summ) -> res_summ
+c("Mean", "sd", "Median", "MAD", "Min", "Max", "Missing") -> colnames(res_summ)
+kable(res_summ,
+      digits = 2,
+      caption = "NIS Seconds Summary")
+
+rep(1, length = nrow(NIS_Data)) -> NIS_Data$Response
+rep(2, length = nrow(NIS_Seconds)) -> NIS_Seconds$Response
+rbind(NIS_Data, NIS_Seconds) -> NIS_Repeated
+
+
+NIS_Repeated[order(NIS_Repeated$ID,
+                     NIS_Repeated$`Date`,
+                     NIS_Repeated$`Time`),] -> NIS_Repeated
+diff(NIS_Repeated$Date) -> changes
+which(changes == 0) -> first
+first + 1 -> second
+
+NIS_Repeated[c(first, second),] -> NIS_Doubles
+NIS_Doubles[order(NIS_Doubles$ID,
+                     NIS_Doubles$`Date`,
+                     NIS_Doubles$`Time`),] -> NIS_Doubles
+# The odd numbered indices are the first response each day, and the next even numbered index
+#  is the second response that day.
+apply(NIS_Doubles[,6:13], 2, diff) -> same_day_diffs
+# But we only want the odd-numbered rows from same_day_diffs
+same_day_diffs[seq(1, nrow(same_day_diffs), 2),] -> same_day_diffs
+# Now, look at some histograms
+hist(same_day_diffs[,1],
+     main = paste("Difference in ",base::colnames(same_day_diffs)[1]))
+hist(same_day_diffs[,2],
+     main = paste("Difference in ",base::colnames(same_day_diffs)[2]))
+hist(same_day_diffs[,3],
+     main = paste("Difference in ",base::colnames(same_day_diffs)[3]))
+hist(same_day_diffs[,4],
+     main = paste("Difference in ",base::colnames(same_day_diffs)[4]))
+hist(same_day_diffs[,5],
+     main = paste("Difference in ",base::colnames(same_day_diffs)[5]))
+hist(same_day_diffs[,6],
+     main = paste("Difference in ",base::colnames(same_day_diffs)[6]))
+hist(same_day_diffs[,7],
+     main = paste("Difference in ",base::colnames(same_day_diffs)[7]))
+hist(same_day_diffs[,8],
+     main = paste("Difference in ",base::colnames(same_day_diffs)[8]))
+
+
+```
+
+
+As for the within-day changes....not too bad, I think. Perhaps EWS?
+
+
+Lets look at the PCA results; do the scales hang together well enough?
+```{r PCA, include = FALSE, eval = FALSE}
+NISresults[,7:57] -> scores
+which(NISresults$CompletedSession == FALSE) -> incomplete
+scores[-incomplete,] -> scores
+
+scoresPCAmethods <- pca(scores, 
+                        scale = "uv", 
+                        center = TRUE, 
+                        nPcs = 2, 
+                        method = "svd")
+slplot(scoresPCAmethods,
+       scoresLoadings = c(FALSE,TRUE))
+sDev(scoresPCAmethods)
+pcaMethods::loadings(scoresPCAmethods)   # conflict with stats!
+
+```
+OK, the instruments hang together mostly okay, so we'll continue with them.
+
+Cluster the survey data into pseudo-attractors. Currently, this uses all instruments on an even basis (Psych, PTSD, CSE, Shift, Perceived, Received, Coping). However, this may be inappropriate:
+- Should Shift get more weight?
+- Some of these are dynamic variables rather than static variables.
+- What is the appropriate distance/dissimilarity measure to use here? (In particular, is the Euclidean distance bad?)
+```{r Clustering_attractors_old, eval = FALSE}
+#load(here("Data/NIS_Z_Data.RData")) # Z-scores of instruments
+load("./Data/NIS_Z_Data.RData") # Z-scores of instruments
+
+# For external (ToMaTo) clustering:
+#write.table(NIS_Z_Data[,6:12], 
+#            file = here("Tomato/inputs/cluster_w_o_density.txt"), 
+#            row.names = FALSE, 
+#            col.names = FALSE)
+
+# Create the distance matrix
+parDist(x = as.matrix(NIS_Z_Data[,6:13]),
+        method = "euclidean") ->     # Define a better one?
+  score_dist                         # Create distance matrix
+
+round(score_dist, digits = 3) -> 
+  score_dist_3                       # Ignore round-off error
+
+# Cluster
+hclust(score_dist_3,                  # Hierarchical clustering
+       method = "average",            # Distance to cluster average
+       members = NULL) -> NISClust  
+# Do not plot. I mean, really...5412 cases on a single graph!?!?
+
+# Cut at 3 to 30 groups
+cutree(NISClust, 3:30) -> NISGroups # Group memberships
+cbind(NIS_Z_Data, NISGroups) -> full_catalog
+paste0("k.eq.",colnames(NISGroups)) -> colnames(full_catalog)[14:41]
+#save(full_catalog, file = here("Data/ZClusters.RData"))
+save(full_catalog, file = "./Data/ZClusters.RData")
+
+# Do this via daisy() and gower
+# There are 6166 unique values of dissZ; 872 when rounded to
+#  3 digits.
+daisy(NIS_Z_Data[,6:13],
+      metric = "gower") -> dissZ
+hclust(dissZ,
+       method = "average",
+       members = NULL) -> NISClust_daisy
+cutree(NISClust_daisy, 3:30) -> NISGroups_daisy # Group memberships
+cbind(NIS_Z_Data, NISGroups_daisy) -> full_catalog_daisy
+paste0("k.eq.",colnames(NISGroups_daisy)) -> 
+  colnames(full_catalog_daisy)[14:41]
+#save(full_catalog_daisy, file = here("Data/ZClustersDaisy.RData"))
+save(full_catalog_daisy, file = "./Data/ZClustersDaisy.RData")
+```
+
+How many clusters? Let's use the silhouette method to find out.
+```{r num_clusters, include = FALSE, eval = FALSE}
+for(index in 14:26) {
+silhouette(full_catalog[, index],
+           dist(select(full_catalog,
+                       Psych, PTSD, CSE, Shift,
+                       Approach, Avoid, Perceived, Received))) -> sil.hclust
+print((index-11))
+print(length(which(sil.hclust[,3] < 0)))
+print(mean(sil.hclust[,3]))
+print(table(sil.hclust[,1]))
+}
+
+for(index in 14:35) {
+silhouette(full_catalog_daisy[, index],
+           dist(select(full_catalog_daisy,
+                       Psych, PTSD, CSE, Shift,
+                       Approach, Avoid, Perceived, Received))) -> sil.hclust
+print((index-11))
+print(length(which(sil.hclust[,3] < 0)))
+print(mean(sil.hclust[,3]))
+print(table(sil.hclust[,1]))
+}
+
+```
+
+There are improvements at 6  and 14 clusters (via euclidean distance) and at 4 and 19 clusters (via gower). The 4 cluster solution is terrible; it is two clusters with two singletons. The 6 cluster solution isn't much beter. The 19 cluster solution is this:
+1035 negative silhouette values
+
+   1    2    3    4    5    6    7    8    9   10   11   12   13   14   15   16   17   18   19 
+ 124  881 1711  889  279  113    6   83    1   54   39   70    1   17    1   18   11    2    1 
+ 
+ Essentially, this is 9 clusters, 2 smallish, 2 really small, a 6, a 2, and 4 singletons
+ 
+ The 14 cluster solution is this:
+ 1143 negative silhouette values
+
+   1    2    3    4    5    6    7    8    9   10   11   12   13   14 
+ 325 2400  934  118    1   44    2  157   76  213   14    7    1    9 
+ This is 6 good clusters, 2 decent sized ones, and 6 small.
+
+
+The process is:
+
+1. Look at the distribution of members in each pseudo-attractor cluster.
+2. Look at the cluster centers for each pseudo-attractor cluster.
+3. For each cluster, get a distribution of each member's distance from the cluster center
+4. For each participant, create a transition matrix from their cluster memberships.
+5. Cluster the transition matrices into matrix clusters.
+6. Choose, say, 5 clusters.
+7. Look at the distribution of members for each cluster. If decent, then continue. If not, increase the number of matrix clusters by one and repeat this step.
+8. Look at the mean transition matrix for each cluster; do this by looking at the transition networks.
+
+
+Let's look at the Z-scores of each cluster. Start with the hclust() 14 cluster.
+```{r trajectory_step_2, eval = FALSE}
+full_catalog %>%
+  group_by(., k.eq.14) %>%
+  summarize(., Psy = mean(Psych), sd_Psy = sd(Psych), 
+            PTSD = mean(PTSD), sd_PTSD = sd(PTSD),
+            CSE = mean(CSE), sd_CSE = sd(CSE), 
+            Shift = mean(Shift), sd_Shift = sd(Shift),
+            Approach = mean(Approach), sd_Ap = sd(Approach),
+            Avoid = mean(Avoid), sd_Av = sd(Avoid),
+            Percd = mean(Perceived), sd_Perc = sd(Perceived),
+            Recd = mean(Received), sd_Recd = sd(Received)) ->
+  attractor_centers
+as.vector(table(full_catalog$k.eq.14)) -> attractor_centers$N
+attractor_centers %>%
+  arrange(., desc(N)) -> attractor_centers
+options(digits = 2)
+attractor_centers[1:8,
+                  c(1,18,2,4,6,8,10,12,14,16)]
+
+# These are mean Z-scores for the largest pseudo attractors:
+# Which are healthiest? Least healthy?
+##     N     Psy    PTSD     CSE   Shift  Approach   Avoid    Percd    Recd
+## 	2400	  0.34	  0.45	  0.53	  0.71	   -0.25	  0.35	   0.35 	-0.05
+## 	 934	 -0.29	 -0.34	 -0.87	 -1.33	   -0.42	 -0.29	  -0.72	  -0.60
+##   325	 -0.63	 -1.45	 -0.65	 -0.96	    1.13	 -0.48	  -0.54	   0.33
+##   213	  0.02	  0.10	  0.60	  0.70	    1.97	 -0.37	   0.72	   1.31
+##   157	  0.18	  0.06	 -0.53	 -0.62	    0.01	 -0.64	   0.02	   1.34
+##   118	 -2.24	 -1.95	 -1.13	 -0.81	    0.56	 -1.39	  -1.19	  -0.45
+##    76	 -1.81	 -0.34	 -1.22	 -0.62	    0.04	  0.16	   0.71	   0.45
+##    44	  0.83	 -1.42	 -1.61	 -1.25	    2.08	 -1.65	  -1.51	   1.53
+
+```
+
+Now, for the transition matrices
+```{r trajectory_4, eval = FALSE}
+# For demonstration purposes, will use k = 14
+14 -> k
+
+# Get just the data that are needed (Id, Study, Date and k.eq.7)
+full_catalog[,c(1, 2, 4, 25)] -> trans_cat
+
+# Create a unique participant+study ID
+trans_cat %>%
+  mutate(., SID = paste0(ID, Study)) -> trans_cat
+
+# Clean up
+trans_cat[,-c(1,2)] -> trans_cat
+
+# Table the ID frequencies
+table(trans_cat$SID) -> SID_freq
+
+#Eliminate those SID that only have one response:
+trans_cat[-which(trans_cat$SID %in%
+                   names(which(SID_freq == 1))),] -> 
+  trans_cat
+
+trans_cat[order(trans_cat$SID,
+                trans_cat$Date),] -> 
+  trans_cat  # Guarantee proper ordering
+
+# Create an empty list for the results
+list() -> trans_ls
+
+# For each unique SID, create a normalized transition matrix of the cluster
+#  number for that SID. Add that and the number of transitions for that SID
+#  to the list.
+unique(trans_cat$SID) -> unique_id  # 161 unique ids
+lapply(unique_id, make_trans, trans_cat, k) -> trans_ls
+
+# An array is easier for me (until I figure out package:purrr better) than the
+#  list for some things, so:
+as.matrix(unlist(trans_ls)) -> trans_arr
+c(14,14,(length(trans_ls))) -> dim(trans_arr)
+
+## A sample transition matrix (NIS-only data)
+#options(digtis = 3)
+#trans_arr[,,21]
+
+```
+OK, there's a problem with the transition matrices: They should sum appropriately, shouldn't they? But they don't. They sum to 1, but shouldn't each column sum to 1?
+
+
+
+Cluster the transition matrices. For now, we'll ignore the weights (available from SID_freq). unique_id and trans_ls are sorted in the same order right now.
+```{r trajectory5, eval = FALSE}
+parDist(trans_ls,
+        diag = TRUE,
+        upper = TRUE) -> distances
+hclust(distances,
+       method = "average") -> mat_clust
+{
+  plot(mat_clust, hang = -1,
+       labels = FALSE)
+  abline(h = 0.75, 
+         col = "darkgreen",
+         lwd = 3)
+}
+```
+Results: Some small clusters and 3 decently large clusters when cut at a height of 0.75. The small clusters are mostly the last to join up, so they are quite different from the rest.
+
+So, this says that most of the participants fall into one of three patterns, while four of the participants are much different from the rest. A BPR thought: Do we know what percentage of the participants (and if so, which ones) "never recovered" (or, in the extreme, devolved into suicide or some permanent state of depression, etc.)? Do the "never recovered" participants show up as the four who are quite different from the rest?
+```{r trajectory6, eval = FALSE}
+cutree(mat_clust, h = 0.75) -> clust_membership
+table(clust_membership) -> cluster_tbl
+cluster_tbl
+
+# NIS-only Data: Trajectory membership
+##   1   2   3   4   5   6   7   8
+##  98   1  28  28   3   1   1   1
+```
+
+We have the following information about each trajectory (each of these variables is sorted in the same order):
+
+- Transition matrix (probability of each type of transition) (trans_ls)
+- Number of transitions for each trajectory (SID_freq)
+- Participant and study identifier (unique_id)
+- Which trajectory cluster the trajectory is in (clust_membership)
+
+Look at the mean transition matrix for each cluster; display these by looking at the transition networks.
+```{r trajectory7, eval = FALSE}
+length(unique(clust_membership)) -> 
+  num_trajectories                          # Number of clusters
+
+array(0,
+      dim = c(num_clusts,num_clusts,num_clusts),   # Cube
+      dimnames = list(1:num_clusts, 1:num_clusts, 1:num_clusts)) -> 
+  mean_trans_arr
+
+matrix(0,
+       nrow = num_clusts,
+       ncol = num_clusts,
+       dimnames = list(1:num_clusts, 1:num_clusts)) -> 
+  trajectory_vertices 
+
+# For vertex size: How many times does a particular attractor appear in each cluster
+# Group by trajectory cluster
+rep(0, nrow(trans_cat)) -> trans_cat$Member
+for(cluster in 1:num_clusts) {   # For each cluster
+  unique_id[which(clust_membership == cluster)] -> ids # Get the ID 
+  cluster -> trans_cat$Member[which(trans_cat$SID %in%
+                                      ids)]
+}
+# trans_cat$Member has the cluster membership for each row
+for(i in unique(trans_cat$Member)) {
+  trans_cat$k.eq.14[which(trans_cat$Member == i)] ->
+    temp_vec
+  for(j in 1:num_clusts) {
+    length(which(temp_vec == j)) -> trajectory_vertices[i,j]
+  }
+}
+
+# For edge size
+
+for(cluster in 1:num_clusts) {
+  apply(trans_arr[,,which(clust_membership == cluster)],
+        c(1,2), mean) -> mean_trans_arr[,,cluster]
+}
+
+library(igraph)
+# Remove those edges with weights < 1% of the maximum weight.
+mean_trans_arr[,,1] -> gr_mat
+# length(which(gr_mat > 0))
+# 34
+0 -> gr_mat[which(mean_trans_arr[,,1] < max(mean_trans_arr[,,1]/500))]
+# length(which(gr_mat > 0))
+# 24
+
+# Weight should be the weight times the size of the from vertex. In other
+#  words, change the matrix before creating the graph.
+# Row is the from vertex and column is the to vertex
+# Hence, each row is multiplied by the frequency there
+matrix(rep(trajectory_vertices[1,], 7), 
+       nrow = 7,
+       ncol = 7,
+       byrow = FALSE) -> mult_mat
+gr_mat * mult_mat -> gr_mat
+
+graph_from_adjacency_matrix(gr_mat,
+                            mode = "directed",
+                            weighted = TRUE) -> dum_gr
+
+# Best when zoomed to full screen.
+plot(dum_gr,
+     vertex.size = 10 * sqrt(trajectory_vertices[1,])/5,
+     edge.width = 8 * E(dum_gr)$weight / max(E(dum_gr)$weight),
+     edge.curved = TRUE,
+     edge.arrow.size = 0.3,  # Make arrow heads smaller
+     layout = layout_in_circle(dum_gr),
+     vertex.label.dist = c(0,0,0,1,2,0,1),
+     vertex.label.degree = c(0,0,0,pi, pi, 0, 0),
+     vertex.label.cex = 3)
+
+mean_trans_arr[,,3] -> gr_mat
+0 -> gr_mat[which(gr_mat < max(gr_mat/500))]
+matrix(rep(trajectory_vertices[3,], 7), 
+       nrow = 7,
+       ncol = 7,
+       byrow = FALSE) -> mult_mat
+gr_mat * mult_mat -> gr_mat
+
+graph_from_adjacency_matrix(gr_mat,
+                            mode = "directed",
+                            weighted = TRUE) -> dum_gr
+
+# Best when zoomed to full screen
+plot(dum_gr,
+     vertex.size = 10 * sqrt(trajectory_vertices[3,])/5,
+     edge.width = 8 * E(dum_gr)$weight / max(E(dum_gr)$weight),
+     edge.curved = TRUE,
+     edge.arrow.size = 0.3,  # Make arrow heads smaller
+     layout = layout_in_circle(dum_gr),
+     vertex.label.dist = c(0,1,1,1,1,1,1),
+     vertex.label.degree = c(0, pi, pi ,pi, pi, pi, 0),
+     vertex.label.cex = 3)
+```
+
+Chip (12/22/20): Low shift values would indicate that people don't change.
+
+```{r shiftAndChange, eval = FALSE}
+load(here("Data/Clusters.RData")) # Or could load the Z-scores
+
+full_catalog[,c(1,4,9,17)] -> shift_cat  # Just the data we need
+table(shift_cat$ID) -> ID_freq
+
+shift_cat[-which(shift_cat$ID %in%                  # Eliminate participants...
+                   names(which(ID_freq == 1))),] -> #  who only respond once.
+  shift_cat
+
+shift_cat[order(shift_cat$ID,              # Guarantee proper ordering
+                shift_cat$Date),] -> 
+  shift_cat  
+
+# Create an empty list for the results
+list() -> shift_ls
+
+# For each unique ID, create a normalized transition matrix of the cluster
+#  number for that ID. Add that and the number of transitions for that ID
+#  to the list.
+unique(shift_cat$ID) -> unique_id
+
+array(0, dim = c(length(unique(shift_cat[,4])),
+                 length(unique(shift_cat[,4])),
+                 2)) -> shifts_arr
+for(id in 1:length(unique_id)) {
+  shift_cat[which(shift_cat$ID == unique_id[id]),3] -> shift_ts
+  shift_cat[which(shift_cat$ID == unique_id[id]),4] -> clust_ts
+  for(index in 1:(length(shift_ts)-1)) {
+    shifts_arr[clust_ts[index], clust_ts[index+1],1] +
+      shift_ts[index] ->
+      shifts_arr[clust_ts[index], clust_ts[index+1],1]
+    shifts_arr[clust_ts[index], clust_ts[index+1],2] + 1 ->
+      shifts_arr[clust_ts[index], clust_ts[index+1],2]
+  }
+}
+
+# Now, check out the hypothesis: Do non-transitions have a higher
+#  Shift than transitions? (Remember, Shift is reverse coded.)
+sum(diag(shifts_arr[,,1])) -> no_shift_sum
+sum(diag(shifts_arr[,,2])) -> no_shift_count
+sum(shifts_arr[,,1]) - no_shift_sum -> shift_sum
+sum(shifts_arr[,,2]) - no_shift_count -> shift_count
+
+print("Mean shift score for non-transitions:")
+no_shift_sum / no_shift_count
+print("Mean shift score for transitions:")
+shift_sum / shift_count
+
+# Overall
+## Measure    Transition  No-Transition
+## Psych        -0.12       0.07
+## PTSD         -0.28       0.19
+## CSE           0.00      -0.00
+## Shift        -0.63       0.41
+## Coping       -0.31       0.20
+## Perceived    -0.33       0.22
+## Received     -0.12       0.08
+
+```
+These effect sizes all seem larger than what one might usually get, but the clustering process pretty much wiped out all the small-ish effect sizes.
+
+BEB (email, 12/23/20) suggests looking at "generalized estimating equations" for dealing with this situation where there is so much covariation.
+
+Once we determine a method for using the cluster center information for ranking the clusters from most-healthy to least-healthy, we can study the transitions to determine which measures result in less-to-more-healthy transitions and which measures result in opposite movement. (This is still ignoring the memory effect; the whole point of the attractor is that the attractor is a single unit, so sub-transitions within the attractor are not entirely the best way to go.)
+
+Here's a reproduction of the table from above:
+These are mean Z-scores for each pseudo attractor: Psych, PTSD, CSE, Shift
+ Coping Behavior, Perceived Support, and Received Support
+ Attract    N    Psy    PTSD     CSE   Shift   Cope    Perc    Recd
+   1	   1342  -0.19	 -0.54	 -0.28	 -1.20	-0.26	  -0.60	  -0.14
+   2	    218  -2.17	 -1.48	 -0.32	 -1.20	-0.64	  -1.16	  -0.52
+   3	   1502   0.31	  0.41	  1.09	  0.69	-0.73	   0.39	   0.01
+   4	     21  -2.31	 -1.82	 -0.67	 -1.08	 0.33	   0.27	   1.19
+   5	     11  -2.00	  0.59	 -0.98	 -1.27	 0.57	   0.88	   0.06
+   6	   1201   0.27	  0.38	 -0.97	  0.72	 1.31	   0.39	   0.21
+   7	      5   0.98	  0.99	  1.71	  0.49	-0.74  	-1.97	   1.68
+
+[Another was to get cluster info](https://www.r-bloggers.com/2021/01/how-to-report-the-distribution-of-attributes-per-cluster/)
+
+Thoughts on the ranking of clusters.
+
+1. Clearly, PTSD symptoms are important. (Duh.)
+2. If some of these are not relevant, should repeat the process without them (E.g., should received support be included here? What is the appropriate criteria for inclusion in the pseudo-attractor dynamics? It seems that...I still dunno. However, my untrained idea is that received support, perceived support, and PTSD symptoms belong to different dynamical categories.
+
+
+
+There are alternative approaches to plotting the transition networks (plot.network, ggnetwork, qgraph, geom_net, etc.) but each seems to be missing the ability to do something key. (E.g., plot.network seems to not plot loops properly.) Of course, user lack-of-talent may be a factor as well. 
+```{r altPlots, eval = FALSE, include = FALSE}
+#for(cluster in 1:num_clusts) {
+#  trans_arr[,,which(clust_membership == cluster)] -> temp_arr
+#  apply(temp_arr, c(1,2), mean) -> mean_trans_arr[,,cluster]
+#  qgraph((mean_trans_arr[,,cluster] * sqrt(cluster_tbl[cluster]) * 20),
+#       layout = "circle",
+#       mode = 'direct',
+#       directed = TRUE,
+#       weighted = TRUE,
+#       vsize = sqrt(clust_mat[cluster,]),
+#       title = paste("Cluster", cluster),
+#       edge.color = "darkgreen",
+#       trans = .95)
+#}
+
+# The two most populous trajectories
+qgraph(mean_trans_arr[,,1],
+    layout = "circle",
+    mode = 'direct',
+    directed = TRUE,
+    weighted = TRUE,
+    vsize = sqrt(trajectory_vertices[1,])/5,
+    title = paste("Cluster", 1),
+    esize = mean_trans_arr[,,1] * 10 / max(mean_trans_arr[,,1]),
+    edge.color = "darkgreen",
+    trans = .95)
+
+qgraph(mean_trans_arr[,,3],
+       layout = "circle",
+       mode = 'direct',
+       directed = TRUE,
+       weighted = TRUE,
+       vsize = sqrt(trajectory_vertices[3,]/5),
+       title = paste("Cluster", 3),
+       esize = mean_trans_arr[,,3] * 10 / max(mean_trans_arr[,,3]),
+       edge.color = "darkgreen",
+       trans = .95)
+
+# geomnet appraoch
+# Need an edge data frame ("from" and "to" in blood example)
+# Need a vertex data fram ("label" and "Predominance" in blood example)
+data(blood)
+blood$edges[1:27, 1:2] -> edge_df
+blood$vertices[1:32, c(1,5)] -> vert_df
+
+ggplot(data = edge_df, aes(from_id = from,
+                           to_id = to)) +
+  geom_net(colour = "blue",        # Vertex color
+           layout.alg = "circle",  # Layout in a circle
+           labelon = TRUE,         # Display vertex labels?
+           size = (1:27)/10,             # Vertex size
+           directed = TRUE,        # Directed graph
+           vjust = 0.5,            # Vertex-label distance
+           arrowsize = 0.5,          # Size of arrow (times 10 points)
+           linewidth = (1:27)/10,  # Width of lines
+           arrowgap = 0.05,
+           selfloops = TRUE) +     # Include self-loops
+  theme_net()
+
+
+# plot.network version
+library(network)
+# Set the edge widths to be the proportional to the edgewidth 
+plot.network(as.network(mean_trans_arr[,,1]),
+             label = network.vertex.names(as.network(mean_trans_arr[,,1])),
+             mode = "circle",
+             displayisolates = TRUE,
+             vertex.cex = sqrt(trajectory_vertices[1,])/5,
+             edge.lwd = (mean_trans_arr[,,1]) /
+               max(mean_trans_arr[,,1]),
+             usearrows = TRUE,
+             edge.curve = 0.04,
+             usecurve = TRUE)
+# I don't know what is going on with the loops in plot.network. So...
+
+```
+
+
+
+Do better display of edge sizes. These may be too faint to see in many places
+
+Notice that in many cases (e.g., cluster 1) there are relatively many transitions from one attractor to itself. Should we go to event based transitions to reduce this? (This is tied up with the characteristic time question.)
