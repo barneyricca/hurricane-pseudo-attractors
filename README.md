@@ -1,2 +1,2 @@
 # hurricane-pseudo-attractors
-Code to accompany Littleton et al. (under review)
+R code to accompany Littleton et al. (under review)
